@@ -1,0 +1,5 @@
+{
+  "_comment": "复制成 reset.json 后按实测填写。joints 是 6 个弧度值，gripper 是 0~1。",
+  "joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "gripper": 1.0
+}

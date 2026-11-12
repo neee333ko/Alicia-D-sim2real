@@ -1,0 +1,37 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- ROS 2 / colcon ----
+build/
+install/
+log/
+
+# ---- 数据与权重（体积大、可重新生成）----
+datasets/
+checkpoints/
+
+# ---- 运行日志（含 Isaac Sim 的 USD 缓存、livestream 日志）----
+logs/
+
+# ---- 读会话时解压出来的临时目录 ----
+.tmp_session_read/
+
+# ---- Docker 构建缓存与构建日志 ----
+.docker/
+build_*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---- 本地环境变量 ----
+.env
+*.local
+udev

@@ -1,0 +1,34 @@
+# 两路相机的参数。改分辨率/帧率/设备号只动这一个文件。
+#
+# 设备号会变：插拔、重启、换 USB 口都可能让 /dev/video0 和 /dev/video2 对调。
+# 先用序列号确认是哪个物理相机：
+#   udevadm info -q property -n /dev/video0 | grep ID_SERIAL
+# 然后写 udev 规则固定成 /dev/cam_front、/dev/cam_wrist：见 pi/udev/99-alicia-cameras.rules，
+# 里面写了怎么拿序列号、怎么安装（需要 root）。
+#
+# 查这台相机到底支持哪些格式和帧率（确认能不能跑 30fps 的唯一可靠办法）：
+#   v4l2-ctl --list-formats-ext -d /dev/video0
+
+cam_front:
+  ros__parameters:
+    video_device: /dev/cam_front
+    # MJPG 才能在 640x480 下跑满 30fps；YUYV 受 USB 带宽限制通常只有 15~20fps
+    pixel_format: MJPG
+    image_size: [640, 480]
+    time_per_frame: [1, 30]
+    # 必须转成 rgb8：默认输出是 yuv422_yuy2，policy_node 不认这个编码
+    output_encoding: rgb8
+    camera_frame_id: cam_front_optical
+    camera_info_url: file:///calib/front.yaml
+    io_method: mmap
+
+cam_wrist:
+  ros__parameters:
+    video_device: /dev/cam_wrist
+    pixel_format: MJPG
+    image_size: [640, 480]
+    time_per_frame: [1, 30]
+    output_encoding: rgb8
+    camera_frame_id: cam_wrist_optical
+    camera_info_url: file:///calib/wrist.yaml
+    io_method: mmap

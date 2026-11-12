@@ -1,0 +1,16 @@
+# 让专家执行一次抓取放置。
+# 用 action 而不是服务：动作持续数秒、需要进度反馈，abort 时要能真正取消。
+
+# ---- goal ----
+int32 id                # 试次号，便于日志对齐 /orch/trial
+
+---
+# ---- result ----
+bool success
+string message
+float32 duration_s
+
+---
+# ---- feedback ----
+string phase            # approach / grasp / lift / transfer / place / retreat
+float32 progress        # 0.0 ~ 1.0

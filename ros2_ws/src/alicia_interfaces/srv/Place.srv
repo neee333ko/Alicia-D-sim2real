@@ -1,0 +1,8 @@
+# 把一个物体摆到指定位置（世界坐标系，米）。
+# 服务返回表示仿真侧已经摆放完成，调用方不需要再 sleep。
+float64 x
+float64 y
+float64 z
+---
+bool success
+string message

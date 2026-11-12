@@ -1,0 +1,42 @@
+# 成功判定的所有阈值。改完重启 success_detector 生效。
+#
+# judge 选模式：
+#   vision        真机用。读图像，看质心是否落在杯口圆内。单目分不出"杯里"和"悬在杯口上方"。
+#   ground_truth  仿真用。读 /object/pose 的三维坐标，比距离 + 高度，没有歧义。
+#                 只能用于仿真；真机没有 /object/pose。
+#
+# 这些数必须在真机现场、实际光照下调出来 —— 白天/夜里/开灯/阴影，
+# 同一个红色方块的 HSV 能差一倍。调的时候看 /detector/mask 话题：
+#   ros2 run rqt_image_view rqt_image_view /detector/mask
+# 方块整个白了说明阈值合适；有反光噪点说明太松；方块都不见了说明太紧。
+
+# 任务名：和 /task/instruction 里的字符串对应。
+# v1 只有一套判据，对不上只会告警，不会切换。
+judge: vision
+task: cube_into_cup
+
+episode:
+  settle_s: 0.5        # 判定"停稳"的时间窗
+  settle_px: 2.0       # 时间窗内质心位移小于这个值算停稳
+  hold_s: 2.0          # 所有条件成立后要保持多久
+  timeout_s: 15.0      # 试次超时
+
+cup:
+  # 视觉模式用像素坐标（原点在图像左上角），标定一次即可
+  center_px: [320, 300]
+  radius_px: 35.0      # 杯口内径对应的像素半径
+  margin_px: 5.0       # 判定余量：离圆边至少 5px 才算进去
+  # 真值模式用三维坐标（和 /object/pose 同一个世界坐标系，单位米）
+  xy_m: [0.20, 0.00]
+  radius_m: 0.035      # 杯口内径半径
+  height_m: 0.09       # 杯口高度，方块必须低于这个值
+
+cube:
+  # 红色方块，色相跨 0 度，所以分两段
+  ranges_lower: [[0, 120, 60], [170, 120, 60]]
+  ranges_upper: [[10, 255, 255], [180, 255, 255]]
+  min_area_px: 200     # 小于这个面积当噪点
+  settle_m: 0.002      # 真值模式下"停稳"的阈值（米）
+
+gripper:
+  open_min: 0.8        # 夹爪开度大于此值算已松手（ROS 侧 0~1）

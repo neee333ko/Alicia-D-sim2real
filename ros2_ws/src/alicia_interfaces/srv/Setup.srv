@@ -1,0 +1,8 @@
+# 一轮开始时同步场景里固定不动的物体（主要是杯子）。
+# 每个试次不变，所以只在 /orch/start 之后调一次。
+float64 cup_x
+float64 cup_y
+float64 cup_z
+---
+bool success
+string message

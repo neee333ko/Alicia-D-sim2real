@@ -1,0 +1,109 @@
+# ============================================================
+# 任务定义：方块放进杯子 (cube_into_cup)
+# 真机采集 / 训练 / 仿真 / 评测 四个脚本共用这一份，参数不要再散到 shell 里。
+# 单位一律 米 / 弧度 / 秒。要写角度的地方字段名带 _deg。
+# ============================================================
+name: cube_into_cup
+version: 1
+frame: world          # 原点=桌面台面左前角，x 指向机器人，y 向左，z 向上
+
+# ---------- 物体 ----------
+object:
+  cube:
+    size: 0.030       # 边长，正方体
+    mass: 0.020
+    friction: 0.8
+    color: red        # 真机用红色，HSV 阈值分割
+    real_material: 硬塑料
+    # 30mm 方块 vs 70mm 杯内径 → 单边余量 20mm，不至于太难也不至于一看就会
+  cup:
+    inner_diameter: 0.070
+    outer_diameter: 0.078
+    height: 0.090
+    mass: 0.050
+    wall: 0.004
+    real_material: 硬塑料（不要纸杯，会被夹爪压变形）
+    markers:
+      rim: {dict: 4X4_50, id: 0, size: 0.020, mount: 杯口外壁}      # 解算杯口圆心
+      bottom: {dict: 4X4_50, id: 1, size: 0.020, mount: 杯内底面}   # 被方块挡住 = 掉进去了
+
+# ---------- 摆位 ----------
+spawn:
+  cube: {center: [0.42, 0.00, 0.015], yaw_deg: 0}   # z 是方块中心高度
+  cup:  {center: [0.52, 0.14, 0.045], fixed: true}
+  randomization:                # 训练数据先固定，成功率稳了再一级一级加
+    stage0: {cube_xy: 0.000, cube_yaw_deg: 0}
+    stage1: {cube_xy: 0.030, cube_yaw_deg: 0}
+    stage2: {cube_xy: 0.030, cube_yaw_deg: 30}
+
+# ---------- 脚本专家批量生成（仿真） ----------
+expert:
+  count: 200                 # 方块随机位置个数
+  radius_m: 0.03             # 在 spawn.cube.center 周围 ±radius 的方形区域内取位置
+  rounds_per_position: 1     # 每个位置跑几个专家轮次（测稳定性才需要 >1）
+  trial_timeout_s: 20        # 单试次最长等待（等 /orch/result）
+
+# ---------- 机械臂 ----------
+robot:
+  dof: 6
+  joints: [Joint1, Joint2, Joint3, Joint4, Joint5, Joint6]
+  joint_units: rad
+  gripper: {open: 1.0, close: 0.0, command: 归一化 0~1}
+  reset_pose: poses/reset.json    # 6 个关节弧度，真机实测标定后写进去，别在这里手填
+  action_space: joint_position    # 必须和实机 set_joint_angles() 一致
+
+# ---------- 相机 ----------
+camera:
+  front: {name: cam_front, resolution: [640, 480], fps: 30, mount: 桌面支架, fixed: true}
+  wrist: {name: cam_wrist, resolution: [640, 480], fps: 30, mount: 夹爪上方, fixed: true}
+  rule: 整个数据集期间不许移动、不许改焦距
+
+# ---------- 成功判据 ----------
+success:
+  sim:                        # 仿真里有真值，直接读位姿
+    - cube.pose.z < cup.height - 0.010        # 方块中心低于杯口
+    - cube.pose.xy 在杯口内径圆内 (r < 0.035)
+    - gripper > 0.8                            # 已松开
+    - 以上保持 hold_s
+  real:                       # 真机只能看画面
+    - 检测到 rim marker (id 0) → 杯口圆心 + 半径
+    - 方块红色质心落在杯口圆内 (r < 0.035)
+    - bottom marker (id 1) 被遮挡或丢失      # 关键：区分"放进去了"和"悬在口上"
+    - gripper 指令已回 1.0
+    - 方块质心 0.5s 内位移 < 2mm              # 停稳
+    - 以上保持 2.0s
+  hold_s: 2.0
+  settle_s: 0.5
+
+# ---------- 一次试次 ----------
+episode:
+  timeout_s: 15
+  fps: 30
+  max_steps: 900
+  reset_between: true         # 每个试次重新摆方块，杯子不动
+
+# ---------- 数据 ----------
+data:
+  project_root: /home/tongou.wei/workspace/src/pi   # 所有数据和工程文件都在这底下，不散到别处
+  root: /home/tongou.wei/workspace/src/pi/datasets/cube_into_cup
+  demos_dir: demos_v1
+  demo_count: 30
+  language: "把方块放进杯子里"   # 给 VLA 用；ACT 忽略
+
+# ---------- 训练 ----------
+train:
+  policy: act
+  steps: 30000
+  batch_size: 32
+  lr: 1.0e-5
+  save_every: 3000
+  ckpt_dir: /home/tongou.wei/workspace/src/pi/checkpoints/act_v1
+
+# ---------- 评测 ----------
+eval:
+  variants: 3                 # stage0/stage1/stage2 各 10 次
+  trials_per_variant: 10
+  accept:
+    too_easy: 0.90            # 高于此：任务太简单，加难度
+    usable: [0.40, 0.90]      # 落在这里才值得继续
+    too_hard: 0.40            # 低于此：先简化任务或补数据
