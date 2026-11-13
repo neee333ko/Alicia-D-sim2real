@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """orchestrator_node.py — 整个流程的调度中心。
 
-一个地方控制顺序：放物体 → 复位 → 开窗 → 让专家动 → 等判定 → 关窗 → 记账。
+一个地方控制顺序：摆物体+复位 → 开窗 → 让专家动 → 等判定 → 关窗 → 记账。
 录制和判定不归它管：两个节点订阅 /orch/trial 自己开窗收尾。
 
 模式
@@ -107,8 +107,8 @@ class Orchestrator(Node):
 
         # ---- 客户端（控制走服务） -------------------------------------------
         self.cli_setup = self.create_client(Setup, "/sim/setup", callback_group=cb)
+        # 摆方块和机械臂复位是同一个"准备下一条试次"动作，合在这个服务里原子完成
         self.cli_place = self.create_client(Place, "/sim/place", callback_group=cb)
-        self.cli_reset = self.create_client(Trigger, "/sim/reset", callback_group=cb)
 
         # 专家是长动作：要进度、要能取消，所以走 action 而不是服务
         self.ac_expert = ActionClient(self, RunOnce, "/expert/run_once", callback_group=cb)
@@ -150,7 +150,6 @@ class Orchestrator(Node):
         self.required = {
             "sim.setup": self.cli_setup,
             "sim.place": self.cli_place,
-            "sim.reset": self.cli_reset,
         }
 
     # ---------------------------------------------------------------- 回调
@@ -333,7 +332,9 @@ class Orchestrator(Node):
             self.get_logger().info(f"[dry_run] {name}")
             return True
         if req is None:
-            req = Trigger.Request()
+            # 按客户端自己的类型造空请求：Trigger 只是本项目里 reset 的那种，
+            # 写死成 Trigger 的话，给 Place 客户端发请求会直接 TypeError
+            req = cli.srv_type.Request()
         fut = cli.call_async(req)
         deadline = time.monotonic() + timeout
         while not fut.done() and time.monotonic() < deadline:
@@ -463,24 +464,19 @@ class Orchestrator(Node):
             self.get_logger().warn(f"试次 {idx} 跳过：{trial['reason']}")
             return trial
 
-        # 1. 放物体。服务返回即表示仿真侧已摆好，不用再额外等待。
+        # 1. 摆方块 + 复位机械臂。合成一个服务是为了原子性：拆开会留下
+        #    "方块已摆好但机械臂没回零位"的中间态，失败时还要单独善后。
+        #    返回 true 表示两者都已完成，不用再额外等待。
         if not self.call(
             self.cli_place,
             "sim.place",
             Place.Request(x=x, y=y, z=self.cube_z),
-            timeout=5.0,
+            timeout=10.0,
         ):
             trial["reason"] = "place_failed"
             return trial
 
-        # 2. 复位机械臂。失败就不进录制：在错误姿态上开跑，录出来的是脏数据，
-        #    而且原因会被后面的 recorder/expert 报错盖住。
-        if not self.call(self.cli_reset, "sim.reset", timeout=8.0):
-            trial["reason"] = "reset_failed"
-            return trial
-        time.sleep(1.0)
-
-        # 3. 开窗 → 4. 专家
+        # 2. 开窗 → 3. 专家
         #    先设 current_trial 再发 begin：detector 可能回得很快，id 对不上会被丢掉。
         #    录制由 recorder 自己订阅 begin/end 启停，不在这里调用。
         self.current_trial = idx
@@ -490,7 +486,7 @@ class Orchestrator(Node):
 
         expert_ok = self.run_expert(idx, timeout=60.0)
 
-        # 5. 等判定结论。专家没跑完就不等了：这时候判"有没有放进杯子"没有意义。
+        # 4. 等判定结论。专家没跑完就不等了：这时候判"有没有放进杯子"没有意义。
         got = self.result_event.wait(timeout=self.trial_timeout) if expert_ok else False
         if got and self.last_result is not None:
             trial["success"] = bool(self.last_result.get("success"))
@@ -503,7 +499,7 @@ class Orchestrator(Node):
         else:
             trial["reason"] = "no_result"
 
-        # 6. 关窗。recorder 收到 end 自己 flush/close；它出了问题，下一个试次的
+        # 5. 关窗。recorder 收到 end 自己 flush/close；它出了问题，下一个试次的
         #    check_ready 会发现（readiness 不再是 idle），不需要在这里同步等。
         self.pub_trial.publish(self._trial_msg(idx, "end"))
         trial["duration_s"] = round(time.monotonic() - t0, 2)

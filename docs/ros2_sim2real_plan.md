@@ -171,8 +171,7 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 | `/record/start` / `/record/stop` | — | recorder_node | ❌ 已删除，改由 `/orch/trial` 的 begin/end 驱动 |
 | `/orch/start` / `/orch/stop` / `/orch/abort` | `std_srvs/Trigger` | orchestrator | ✅ 已实现 |
 | `/sim/setup` | 自定义 `Setup.srv`（cup_x/cup_y/cup_z） | sim_bridge | ⬜ 待实现 |
-| `/sim/place` | 自定义 `Place.srv`（x/y/z） | sim_bridge | ⬜ 待实现 |
-| `/sim/reset` | `std_srvs/Trigger` | sim_bridge | ⚠️ 已有，语义要改成“到位才返回 success” |
+| `/sim/place` | 自定义 `Place.srv`（x/y/z） | sim_bridge | ⬜ 待实现。一次完成「摆方块 + 机械臂复位」，原子返回 |
 | `/expert/run_once` | action `RunOnce` | sim_expert | ❌ 现为 Trigger 服务，待改成 action |
 
 ### 4.4 约定
@@ -263,7 +262,6 @@ success_detector:
          │ 服务     │ action      │ 事件发布  │ 订阅
    /sim/setup   /expert/run_once  /orch/trial  /orch/result
    /sim/place                    begin/end    /{node}/status ×4
-   /sim/reset
 ```
 
 为什么主线程跑循环、rclpy 在后台 spin：编排逻辑可以用阻塞式写法（顺序调用、等待条件），而回调仍能被并发处理，不会自己把自己锁死。节点启动后**不自动开跑**，保持存活等服务调用。
@@ -272,7 +270,7 @@ success_detector:
 
 | 用途 | 机制 | 例子 | 语义 |
 |---|---|---|---|
-| 执行确认（要同步知道结果） | 服务 | `/sim/setup`、`/sim/place`、`/sim/reset` | `success=true` 表示**动作已完成**，不是“命令已接收” |
+| 执行确认（要同步知道结果） | 服务 | `/sim/setup`、`/sim/place` | `success=true` 表示**动作已完成**，不是“命令已接收” |
 | 长动作（要进度、要能取消） | action | `/expert/run_once` | goal 接受 ≠ 完成；可 cancel、可 feedback |
 | 一对多事件（广播边界） | 话题 | `/orch/trial` | begin/end，订阅者各自决定怎么做 |
 | 持续状态（可晚到、可重发） | 话题 | `/{node}/status`、`/orch/result` | 只缺最新一条就有意义，用 transient_local |
@@ -286,19 +284,19 @@ success_detector:
 ```
 run_trial(idx, x, y)
  0. wait_ready(ready_wait_s)   四路 status 全部 liveness+readiness+未过期，否则跳过
- 1. /sim/place  {x, y, cube_z} 失败 → reason=place_failed，直接返回（还没开窗，无脏数据）
- 2. /sim/reset                 失败 → reason=reset_failed，直接返回（不在错误姿态上开跑）
- 3. 置 current_trial=idx → publish /orch/trial {id, "begin"}
- 4. /expert/run_once  action   失败/超时 → reason=expert_failed
- 5. result_event.wait(trial_timeout)  收到同 id 的 /orch/result → success/reason
- 6. publish /orch/trial {id, "end"}
+ 1. /sim/place  {x, y, cube_z} 摆方块 + 机械臂复位，失败 → reason=place_failed，直接返回
+ 2. 置 current_trial=idx → publish /orch/trial {id, "begin"}
+ 3. /expert/run_once  action   失败/超时 → reason=expert_failed
+ 4. result_event.wait(trial_timeout)  收到同 id 的 /orch/result → success/reason
+ 5. publish /orch/trial {id, "end"}
 ```
 
 几个关键顺序：
 
 - **先置 `current_trial` 再发 begin**。detector 可能回得很快，id 对不上会被 `on_result` 丢掉。
 - **第 0 步放在最前面**。此时还没有任何副作用，跳过试次不会留下半截 episode，也不会把异常数据算进成功率。
-- **第 1、2 步在 begin 之前**。放物体和复位是“准备”，不属于试次；失败时不需要 recorder/detector 开窗再关窗。
+- **第 1 步在 begin 之前**。摆位和复位是“准备”，不属于试次；失败时不需要 recorder/detector 开窗再关窗。
+- **摆位和复位合成一个服务**。拆开会出现“方块已摆好、机械臂还没回零位”的中间态，失败时要单独善后；合并后只有“准备好”和“没准备好”两种结果。
 - **专家失败仍然发 end**。窗口必须成对关闭，否则 recorder 永远停在 recording、下一个试次 `wait_ready` 全部失败。
 - **等待判定用 `result_event`，不用轮询 `last_result`**，abort 时直接 `set()` 唤醒，不必等满 `trial_timeout`。
 
@@ -307,8 +305,7 @@ run_trial(idx, x, y)
 | reason | 含义 |
 |---|---|
 | `not_ready: <明细>` | 下游有节点失联/失活/未就绪，本试次跳过 |
-| `place_failed` | 物体没摆好 |
-| `reset_failed` | 机械臂没回到复位位 |
+| `place_failed` | 摆方块或机械臂复位失败（具体哪一步看服务返回的 message） |
 | `expert_failed` | 专家没跑成功（含被 cancel、超时） |
 | `aborted` | 收到 `/orch/abort` |
 | `no_result` | 专家成功但 `trial_timeout` 内没有判定结论 |
@@ -335,8 +332,7 @@ run_trial(idx, x, y)
 |---|---|---|
 | `check_nodes` 逐个探测 | 2s / 个 | 服务与 action 两套发现机制都要探 |
 | `/sim/setup` | 5s | 一轮一次 |
-| `/sim/place` | 5s | 每试次一次 |
-| `/sim/reset` | 8s | 需要真运动，比摆位宽 |
+| `/sim/place` | 10s | 每试次一次；要摆方块 + 回零位两件事，故比 setup 宽 |
 | action 发送 goal | 5s | 服务端没起来或满载 |
 | action 等 result | 60s | 脚本专家的完整抓取+放置 |
 | 等判定 | `trial_timeout_s`（task.yaml，默认 20s） | 试次级，独立于专家超时 |
@@ -418,7 +414,7 @@ ros2 service call /orch/abort std_srvs/srv/Trigger   # 立即中断
 
 ### 5.12 测试与当前缺口
 
-容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 45 个用例：25 个纯逻辑（状态检查、结果过滤、服务状态机，绕过 `__init__` 注入字段）+ 20 个集成（起真 `Orchestrator` 节点 + 假下游，覆盖服务成功/失败/超时、abort 真 cancel、begin/end 顺序、复位失败、未就绪跳过、汇总输出）。
+容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 44 个用例：25 个纯逻辑（状态检查、结果过滤、服务状态机，绕过 `__init__` 注入字段）+ 19 个集成（起真 `Orchestrator` 节点 + 假下游，覆盖服务成功/失败/超时、abort 真 cancel、begin/end 顺序、摆位失败、未就绪跳过、汇总输出）。
 
 ```bash
 pytest tests -q     # 需 source /ws/install/setup.bash
@@ -429,10 +425,8 @@ pytest tests -q     # 需 source /ws/install/setup.bash
 | 项 | 现状 |
 |---|---|
 | `/expert/run_once` | `sim_expert` 仍是 Trigger 服务，与 action 客户端类型不匹配 → 改为 action server（含 5.9 的两条取消要求） |
-| `/sim/setup`、`/sim/place` | `sim_bridge` 未实现；socket 协议需要加 `CMD_SETUP` / `CMD_PLACE` / `PLACE_DONE` |
-| `/sim/reset` | 已有服务，但当前“开始动就返回”，要改成“到位才 success” |
+| `/sim/setup`、`/sim/place` | `sim_bridge` 未实现；socket 协议需要加 `CMD_SETUP` / `CMD_PLACE` / `PLACE_DONE`。`/sim/place` 要在仿真侧串行做完「摆方块 → 回零位」，两者都到位才返回 success |
 | `/{node}/status` | 四个下游都还没发布 |
-| `run_trial` 里的 `time.sleep(1.0)` | 临时硬等，等 `/sim/reset` 语义修正后删掉 |
 | `recorder_node` | 未实现，需要 idle→recording→idle 状态机 + status |
 
 ---
@@ -667,14 +661,14 @@ pi/
 | `success_detector` | 合成图像：成功路径 2.1s 出结果，超时/手动结束路径 |
 | `sim_bridge` | 假 sim_app：协议往返、关节 30Hz、图像吞吐、断线重连 |
 | 相机启动 | launch + 参数 + udev + 标定模板，未接真机 |
-| `orchestrator` | 容器内真 ROS：45 个用例（纯逻辑 + 假下游集成），覆盖服务失败/超时、abort 真 cancel、begin/end 顺序、未就绪跳过、汇总输出 |
+| `orchestrator` | 容器内真 ROS：44 个用例（纯逻辑 + 假下游集成），覆盖服务失败/超时、abort 真 cancel、begin/end 顺序、未就绪跳过、汇总输出 |
 | 镜像 | base / driver / camera / policy 四个都构建通过 |
 
 ### 已知未做（按优先级）
 
 1. **真机上跑通 camera + driver**：设备名固定、内参标定、串口确认。这是所有真机数据的入口。
 2. **`recorder_node`**：写 LeRobot 数据集。没有它就没有训练数据。
-3. **下游对接编排契约**（详见 5.12）：`sim_expert` 改 action server、`sim_bridge` 实现 `/sim/setup` `/sim/place` 与到位才返回的 `/sim/reset`、四个节点发布 `/{node}/status`。
+3. **下游对接编排契约**（详见 5.12）：`sim_expert` 改 action server、`sim_bridge` 实现 `/sim/setup` 与「摆方块+复位」的 `/sim/place`、四个节点发布 `/{node}/status`。
 4. **`sim_app` + `sim_scene`**：Isaac Lab 场景、关节映射、脚本专家生成数据。
 5. **`pi/policy` 镜像重建**：Dockerfile 已改成 `FROM alicia/base`，但现有镜像是旧的。
 6. **`ActionChunk.msg` 消息包**：现在 chunk 挤在 `Float64MultiArray` 里。

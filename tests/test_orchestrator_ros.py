@@ -35,32 +35,32 @@ def _force_missing(orch):
 # ---------------------------------------------------------------- call
 def test_call_success(live):
     orch, _world = live
-    assert orch.call(orch.cli_reset, "sim.reset", timeout=2.0) is True
+    assert orch.call(orch.cli_place, "sim.place", timeout=2.0) is True
 
 
 def test_call_reports_failure(live):
     orch, world = live
-    world.reset_ok = False
+    world.place_ok = False
 
-    assert orch.call(orch.cli_reset, "sim.reset", timeout=2.0) is False
+    assert orch.call(orch.cli_place, "sim.place", timeout=2.0) is False
 
 
 def test_call_timeout(live):
     orch, world = live
-    world.reset_delay = 0.5
+    world.place_delay = 0.5
 
     t0 = time.monotonic()
-    assert orch.call(orch.cli_reset, "sim.reset", timeout=0.2) is False
+    assert orch.call(orch.cli_place, "sim.place", timeout=0.2) is False
     assert time.monotonic() - t0 < 0.5
 
 
 def test_call_exits_on_abort(live):
     orch, world = live
-    world.reset_delay = 2.0
+    world.place_delay = 2.0
 
     threading.Timer(0.1, lambda: setattr(orch, "abort", True)).start()
     t0 = time.monotonic()
-    assert orch.call(orch.cli_reset, "sim.reset", timeout=5.0) is False
+    assert orch.call(orch.cli_place, "sim.place", timeout=5.0) is False
     # 被 abort 提前打断，不应该等满 5 秒
     assert time.monotonic() - t0 < 1.0
 
@@ -136,18 +136,7 @@ def test_run_trial_place_failure(live):
     trial = orch.run_trial(4, 0.5, 0.0)
 
     assert trial["reason"] == "place_failed"
-    # 放都没放成功，不该复位、更不该开窗
-    time.sleep(0.2)
-    assert world.trial_events == []
-
-
-def test_run_trial_reset_failure(live):
-    orch, world = live
-    world.reset_ok = False
-
-    trial = orch.run_trial(5, 0.5, 0.0)
-
-    assert trial["reason"] == "reset_failed"
+    # 摆位/复位没成功，不该开窗
     time.sleep(0.2)
     assert world.trial_events == []
 

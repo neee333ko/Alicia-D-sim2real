@@ -246,4 +246,4 @@ def test_call_skips_when_dry_run_and_unavailable(orch):
         def call_async(self, _req):  # 不该走到这里
             raise AssertionError("dry_run 不该真的发请求")
 
-    assert orch.call(NoService(), "sim.reset") is True
+    assert orch.call(NoService(), "sim.place") is True

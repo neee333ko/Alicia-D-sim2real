@@ -13,29 +13,28 @@ recorder 录不到 action 字段。真机是"人 → /joint_commands → 臂"，
 
 话题/服务
   订阅  /joint_states    当前关节角（闭环等到位）
-        /object/pose     方块真值（抓取点）
+        /object/pose     杯子与方块真值（alicia_interfaces/ObjectPose）
   发布  /joint_commands  30Hz 关节目标（7 维：6 弧度 + 夹爪 0~1）
-  服务  /expert/run_once 生成一条（阻塞到结束，返回成败）
-        /expert/home     让臂回到复位姿态（调用 /arm/home 之前先用）
+  动作  /expert/run_once 生成一条示范（RunOnce，可取消，带进度反馈）
 
-    python3 sim_expert.py --ros-args -p cup_xy:="[0.52, 0.14]"
+    python3 sim_expert.py --ros-args -p rate_hz:=30.0
 """
 
 from __future__ import annotations
 
 import math
-import threading
 import time
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from alicia_interfaces.action import RunOnce
+from alicia_interfaces.msg import ObjectPose
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
-from std_srvs.srv import Trigger
 
 JOINT_NAMES = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
 
@@ -55,10 +54,7 @@ class SimExpert(Node):
         self.declare_parameter("robot_version", "v5_6")
         self.declare_parameter("gripper_type", "50mm")
         self.declare_parameter("rate_hz", 30.0)
-        # 杯子位置（底座坐标系），和 task.yaml 的 spawn.cup 对应
-        self.declare_parameter("cup_xy", [0.52, 0.14])
-        self.declare_parameter("cup_height", 0.09)      # 杯口高度
-        # 抓取/放置时的抬升量
+        # 抓取/放置时的抬升量（相对方块顶面 / 杯口）
         self.declare_parameter("approach_m", 0.10)
         self.declare_parameter("grasp_lift_m", 0.15)
         self.declare_parameter("release_m", 0.10)
@@ -66,6 +62,10 @@ class SimExpert(Node):
         self.declare_parameter("joint_speed_rad_s", 0.8)
         self.declare_parameter("arrive_tol_rad", 0.03)
         self.declare_parameter("arrive_timeout_s", 4.0)
+        # 夹爪开合是物理过程，指令变了要留时间让它夹/放到实物
+        self.declare_parameter("grip_hold_s", 0.5)
+        # IK 解与当前关节角的单轴最大偏差，超过就认为是解到了另一个分支
+        self.declare_parameter("ik_max_jump_rad", 1.0)
         # 扰动：让仿真数据别太"机械"
         self.declare_parameter("pos_noise_m", 0.003)
         self.declare_parameter("joint_noise_rad", 0.004)
@@ -74,14 +74,14 @@ class SimExpert(Node):
         p = self.get_parameter
         self.rate = float(p("rate_hz").value)
         self.dt = 1.0 / self.rate
-        self.cup = [float(v) for v in p("cup_xy").value]
-        self.cup_h = float(p("cup_height").value)
         self.approach = float(p("approach_m").value)
         self.grasp_lift = float(p("grasp_lift_m").value)
         self.release_h = float(p("release_m").value)
         self.speed = float(p("joint_speed_rad_s").value)
         self.tol = float(p("arrive_tol_rad").value)
         self.arrive_timeout = float(p("arrive_timeout_s").value)
+        self.grip_hold = float(p("grip_hold_s").value)
+        self.max_jump = float(p("ik_max_jump_rad").value)
         self.pos_noise = float(p("pos_noise_m").value)
         self.joint_noise = float(p("joint_noise_rad").value)
         self.jitter = float(p("timing_jitter_s").value)
@@ -103,24 +103,33 @@ class SimExpert(Node):
 
         # ---- 状态 ----------------------------------------------------------
         self.joints: list[float] | None = None
-        self.cube: tuple[float, float, float] | None = None
+        self.last_state_t = 0.0               # 上次收到 /joint_states 的时刻
+        self.cube: tuple[float, float, float] | None = None   # 方块几何中心
+        self.cube_edge: float | None = None                   # 方块边长
+        self.cup: tuple[float, float, float] | None = None    # 杯口中心
         self.cmd = None                      # 当前要发的 7 维命令
         self.busy = False
-        self.result = {"success": False, "reason": "idle"}
+        self.goal = None                     # 正在跑的 action goal，供取消检查
 
         # ---- 接口 ----------------------------------------------------------
         self.pub = self.create_publisher(Float64MultiArray, "/joint_commands", 10)
         self.create_subscription(JointState, "/joint_states", self.on_state, 10)
-        self.create_subscription(PoseStamped, "/object/pose", self.on_object, 10)
+        self.create_subscription(ObjectPose, "/object/pose", self.on_object, 10)
         cb = ReentrantCallbackGroup()
-        self.create_service(Trigger, "/expert/run_once", self.on_run, callback_group=cb)
-        self.create_service(Trigger, "/expert/home", self.on_home, callback_group=cb)
-        self.cli_home = self.create_client(Trigger, "/arm/home")
+        self.ac = ActionServer(
+            self,
+            RunOnce,
+            "/expert/run_once",
+            self.on_goal,
+            callback_group=cb,
+            # rclpy 默认回 CANCEL_REJECTED，不显式接受的话 /orch/abort 会静默失效
+            cancel_callback=lambda _req: CancelResponse.ACCEPT,
+        )
 
         self.create_timer(self.dt, self.publish_cmd)
         self.get_logger().info(
-            f"sim_expert 就绪：杯心 ({self.cup[0]:.2f},{self.cup[1]:.2f})，"
-            f"速度 {self.speed} rad/s，{self.rate:.0f}Hz"
+            f"sim_expert 就绪：速度 {self.speed} rad/s，{self.rate:.0f}Hz，"
+            "等 /object/pose 给出杯子与方块位姿"
         )
 
     # ---------------------------------------------------------------- 回调
@@ -128,10 +137,13 @@ class SimExpert(Node):
         if len(msg.position) < 7:
             return
         self.joints = [float(v) for v in msg.position[:6]]
+        self.last_state_t = time.monotonic()
 
-    def on_object(self, msg: PoseStamped):
-        p = msg.pose.position
-        self.cube = (p.x, p.y, p.z)
+    def on_object(self, msg: ObjectPose):
+        """收下杯子与方块真值。只在生成轨迹时读一次，运动中不再跟随物体。"""
+        self.cube = (msg.cube_pose.x, msg.cube_pose.y, msg.cube_pose.z)
+        self.cube_edge = float(msg.cube_edge_m)
+        self.cup = (msg.cup_pose.x, msg.cup_pose.y, msg.cup_pose.z)
 
     def publish_cmd(self):
         if self.cmd is None:
@@ -140,60 +152,52 @@ class SimExpert(Node):
         msg.data = [float(v) for v in self.cmd]
         self.pub.publish(msg)
 
-    def on_run(self, _req, resp):
+    def on_goal(self, goal_handle):
+        """执行一条示范。execute 回调，跑在 executor 的独立线程里。"""
         if self.busy:
-            resp.success = False
-            resp.message = "already running"
-            return resp
-        if self.joints is None or self.cube is None:
-            resp.success = False
-            resp.message = "还没有 /joint_states 或 /object/pose"
-            return resp
+            goal_handle.abort()
+            return RunOnce.Result(success=False, message="正在执行上一条")
+        if None in (self.joints, self.cube, self.cup, self.cube_edge):
+            goal_handle.abort()
+            return RunOnce.Result(
+                success=False, message="还没有 /joint_states 或 /object/pose（需要杯子、方块位姿和边长）"
+            )
 
         self.busy = True
-        self.result = {"success": False, "reason": "running"}
-        t = threading.Thread(target=self._run_wrapper, daemon=True)
-        t.start()
-        t.join(timeout=60.0)                  # 一条示范最多一分钟
+        self.goal = goal_handle
+        t0 = time.monotonic()
+        try:
+            res = self._run_sequence()
+        except Exception as e:                       # noqa: BLE001
+            res = {"success": False, "reason": f"exception: {e}"}
+            self.get_logger().error(f"专家执行失败：{e}")
+
+        if goal_handle.is_cancel_requested:
+            res = {"success": False, "reason": "canceled"}
+            goal_handle.canceled()
+        elif res.get("success"):
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+
         self.busy = False
-
-        resp.success = bool(self.result.get("success"))
-        resp.message = self.result.get("reason", "")
-        return resp
-
-    def on_home(self, _req, resp):
-        """转到 /arm/home，由 driver/sim_bridge 走它自己的限位和限速逻辑。"""
-        if not self.cli_home.service_is_ready():
-            # 极端情况下退回直接发命令
-            self.cmd = [0.0] * 6 + [1.0]
-            resp.success = False
-            resp.message = "/arm/home 不可用，已直接发零位命令"
-            return resp
-        fut = self.cli_home.call_async(Trigger.Request())
-        deadline = time.monotonic() + 5.0
-        while not fut.done() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not fut.done():
-            resp.success = False
-            resp.message = "/arm/home 超时"
-            return resp
-        resp.success = True
-        resp.message = "homing"
-        return resp
+        self.goal = None
+        self.get_logger().info(f"专家结束：{res}")
+        return RunOnce.Result(
+            success=bool(res.get("success")),
+            message=res.get("reason", ""),
+            duration_s=float(time.monotonic() - t0),
+        )
 
     # ---------------------------------------------------------------- 轨迹
-    def _run_wrapper(self):
-        try:
-            self.result = self._run_sequence()
-        except Exception as e:                       # noqa: BLE001
-            self.result = {"success": False, "reason": f"exception: {e}"}
-            self.get_logger().error(f"专家执行失败：{e}")
-        self.get_logger().info(f"专家结束：{self.result}")
 
     def _run_sequence(self):
         assert self.cube is not None and self.joints is not None
+        assert self.cup is not None and self.cube_edge is not None
         cx, cy, cz = self.cube
-        cup_x, cup_y = self.cup
+        cup_x, cup_y, cup_z = self.cup
+        # 抬升量从方块顶面算，而不是中心：避免夹爪贴着桌面闭合
+        top = cz + self.cube_edge / 2.0
 
         # 抓取点稍微随机偏移，避免 200 条数据全是同一个位置
         cx += self.rng.normal(0, self.pos_noise)
@@ -201,60 +205,118 @@ class SimExpert(Node):
 
         # 一个 keyframe = (4x4 工具位姿 或 None, 夹爪开度, 说明)
         keys = [
-            (pose(cx, cy, cz + self.approach), 1.0, "移动到抓取上方"),
+            (pose(cx, cy, top + self.approach), 1.0, "移动到抓取上方"),
             (pose(cx, cy, cz), 1.0, "下降到抓取位"),
             (pose(cx, cy, cz), 0.0, "闭合夹爪"),
-            (pose(cx, cy, cz + self.grasp_lift), 0.0, "抬升"),
-            (pose(cup_x, cup_y, self.cup_h + self.release_h), 0.0, "移到杯口上方"),
-            (pose(cup_x, cup_y, self.cup_h + self.release_h), 1.0, "松开"),
-            (pose(cup_x, cup_y, self.cup_h + self.release_h + 0.05), 1.0, "撤离"),
+            (pose(cx, cy, top + self.grasp_lift), 0.0, "抬升"),
+            (pose(cup_x, cup_y, cup_z + self.release_h), 0.0, "移到杯口上方"),
+            (pose(cup_x, cup_y, cup_z + self.release_h), 1.0, "松开"),
+            (pose(cup_x, cup_y, cup_z + self.release_h + 0.05), 1.0, "撤离"),
         ]
 
-        for T, grip, label in keys:
+        prev_grip = None
+        total = len(keys)
+        for i, (T, grip, label) in enumerate(keys):
+            # keyframe 之间也查一次，取消后不再白算 IK
+            if self.goal is not None and self.goal.is_cancel_requested:
+                return {"success": False, "reason": "canceled"}
             self.get_logger().info(label)
+            # 只在夹爪开度变化的那一步补保持时间，纯位移不拖慢
+            hold = self.grip_hold if prev_grip is not None and grip != prev_grip else 0.0
             if T is not None:
                 q = self._solve_ik(T, self.joints)
                 if q is None:
                     return {"success": False, "reason": f"IK 无解：{label}"}
-                if not self._move_to(q, grip):
-                    return {"success": False, "reason": f"未到位：{label}"}
+                ok = self._move_to(q, grip, hold)
             else:
-                if not self._move_to(self.joints, grip):
-                    return {"success": False, "reason": f"未到位：{label}"}
+                ok = self._move_to(self.joints, grip, hold)
+            if not ok:
+                return {"success": False, "reason": f"未到位：{label}"}
+            prev_grip = grip
+
+            if self.goal is not None:
+                fb = RunOnce.Feedback()
+                fb.phase = label
+                fb.progress = float((i + 1) / total)
+                try:
+                    self.goal.publish_feedback(fb)
+                except Exception:                    # noqa: BLE001
+                    # cancel 与 feedback 有竞态，此时发布器可能已失效
+                    pass
+
             time.sleep(max(0.0, self.rng.normal(0.15, self.jitter)))
 
         self.cmd = list(self.joints) + [1.0]
         return {"success": True, "reason": "done"}
 
     def _solve_ik(self, T_target, q0):
-        res = self.ik(self.model, T_target, q0, method="dls", multi_start=4)
+        # 固定种子：multi_start 的扰动可复现，同一个位姿不会这次左支下次右支
+        res = self.ik(
+            self.model, T_target, q0, method="dls", multi_start=4, random_seed=0
+        )
         if not res.get("success"):
             return None
-        return [float(v) for v in res["q"]]
+        q = [float(v) for v in res["q"]]
+        # multi_start 只在基础解失败时按残差挑解，可能挑到另一个 IK 分支；
+        # 种子是当前实测角度，正常解离得很近，偏这么多说明换支了，插值会扫出大弧线
+        jump = max(abs(a - b) for a, b in zip(q, q0))
+        if jump > self.max_jump:
+            self.get_logger().warn(f"IK 跳解：单轴偏差 {jump:.2f} rad，放弃这一段")
+            return None
+        return q
 
-    def _move_to(self, q_target, grip) -> bool:
-        """关节空间插值过去，30Hz 发；等到位（不是等固定时长）。"""
+    def _move_to(self, q_target, grip, hold: float = 0.0) -> bool:
+        """关节空间插值过去，30Hz 发；等到位（不是等固定时长）。
+
+        hold：到位后继续保持同一夹爪开度的时间。位姿不变时 dist=0、n=1，
+        插值只发一帧，靠这个把"夹爪合拢所需的时间"补上。
+        """
         q_start = list(self.joints) if self.joints else list(q_target)
-        q_target = list(q_target) + self.rng.normal(0, self.joint_noise, 6).tolist()
+        # 关节噪声要逐元素叠加。写成 list + list 会拼成 12 维，指令直接多出一截。
+        noise = self.rng.normal(0, self.joint_noise, len(q_target))
+        q_target = [float(b + d) for b, d in zip(q_target, noise)]
         dist = max(abs(a - b) for a, b in zip(q_start, q_target))
         n = max(1, int(math.ceil(dist / (self.speed * self.dt))))
 
         for i in range(1, n + 1):
+            # 取消是协作式的：只有这里按帧查，/orch/abort 才能真正打断动作
+            if self.goal is not None and self.goal.is_cancel_requested:
+                return False
             k = i / n
             self.cmd = [a + (b - a) * k for a, b in zip(q_start, q_target)] + [grip]
             time.sleep(self.dt)
 
         # 等真的到位：仿真步进和真实时间不完全对齐，不能只按时间算
         deadline = time.monotonic() + self.arrive_timeout
+        arrived = False
         while time.monotonic() < deadline:
+            if self.goal is not None and self.goal.is_cancel_requested:
+                return False
             if self.joints is None:
+                return False
+            # 断流时 self.joints 会冻在旧值，err 可能恰好很小而被误判到位，
+            # 结果是录到一条"机械臂没动"的假示范。所以先确认反馈还在更新。
+            if time.monotonic() - self.last_state_t > 0.2:
+                self.get_logger().error("超过 0.2s 没收到 /joint_states，无法确认到位")
                 return False
             err = max(abs(a - b) for a, b in zip(self.joints, q_target))
             if err <= self.tol:
-                return True
+                arrived = True
+                break
             self.cmd = q_target + [grip]
             time.sleep(self.dt)
-        return False
+        if not arrived:
+            return False
+
+        # 夹爪指令是位置式的，物理合拢要时间；姿态已到位，原地保持即可
+        if hold > 0.0:
+            deadline = time.monotonic() + hold
+            while time.monotonic() < deadline:
+                if self.goal is not None and self.goal.is_cancel_requested:
+                    return False
+                self.cmd = list(q_target) + [grip]
+                time.sleep(self.dt)
+        return True
 
 
 def main():

@@ -22,6 +22,10 @@ ORCH_SRC = os.path.join(ROOT, "ros2_ws", "src", "orchestrator")
 if ORCH_SRC not in sys.path:
     sys.path.insert(0, ORCH_SRC)
 
+EXPERT_SRC = os.path.join(ROOT, "ros2_ws", "src", "sim_expert")
+if EXPERT_SRC not in sys.path:
+    sys.path.insert(0, EXPERT_SRC)
+
 # 宿主上没有 ROS，直接跳过而不是报一堆 ImportError
 pytest.importorskip("rclpy", reason="需要 ROS 2 环境，请在容器内运行")
 orchestrator_node = pytest.importorskip(
@@ -118,7 +122,6 @@ from rclpy.qos import (  # noqa: E402
     ReliabilityPolicy,
 )
 from std_msgs.msg import String  # noqa: E402
-from std_srvs.srv import Trigger  # noqa: E402
 
 pytest.importorskip("alicia_interfaces", reason="需要先 colcon build alicia_interfaces 并 source")
 from alicia_interfaces.action import RunOnce  # noqa: E402
@@ -179,7 +182,7 @@ class ParamStore:
 
 
 class FakeWorld(Node):
-    """假的下游：sim_bridge 的三个服务 + expert 的 action + detector 的结论。
+    """假的下游：sim_bridge 的两个服务 + expert 的 action + detector 的结论。
 
     每个行为都做成可改的属性，测试里按需调整。所有回调都放在
     ReentrantCallbackGroup 里，否则阻塞式等待会把这个节点的执行线程占死。
@@ -190,9 +193,9 @@ class FakeWorld(Node):
         cb = ReentrantCallbackGroup()
 
         self.place_ok = True
+        # 一次调用要做完摆方块和机械臂复位，慢一点更接近真实
+        self.place_delay = 0.0
         self.place_requests: list[Place.Request] = []
-        self.reset_ok = True
-        self.reset_delay = 0.0
         self.expert_ok = True
         self.expert_seconds = 0.0
         self.expert_goals: list[int] = []
@@ -204,7 +207,6 @@ class FakeWorld(Node):
 
         self.create_service(Setup, "/sim/setup", self.on_setup, callback_group=cb)
         self.create_service(Place, "/sim/place", self.on_place, callback_group=cb)
-        self.create_service(Trigger, "/sim/reset", self.on_reset, callback_group=cb)
 
         self.action_server = ActionServer(
             self,
@@ -231,15 +233,10 @@ class FakeWorld(Node):
 
     def on_place(self, req, resp):
         self.place_requests.append(req)
+        if self.place_delay:
+            time.sleep(self.place_delay)
         resp.success = self.place_ok
         resp.message = "" if self.place_ok else "place refused"
-        return resp
-
-    def on_reset(self, _req, resp):
-        if self.reset_delay:
-            time.sleep(self.reset_delay)
-        resp.success = self.reset_ok
-        resp.message = "" if self.reset_ok else "home not reached"
         return resp
 
     # ---- expert action -------------------------------------------------
