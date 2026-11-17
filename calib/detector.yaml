@@ -10,10 +10,7 @@
 #   ros2 run rqt_image_view rqt_image_view /detector/mask
 # 方块整个白了说明阈值合适；有反光噪点说明太松；方块都不见了说明太紧。
 
-# 任务名：和 /task/instruction 里的字符串对应。
-# v1 只有一套判据，对不上只会告警，不会切换。
-judge: vision
-task: cube_into_cup
+judge: ground_truth
 
 episode:
   settle_s: 0.5        # 判定"停稳"的时间窗
@@ -26,10 +23,8 @@ cup:
   center_px: [320, 300]
   radius_px: 35.0      # 杯口内径对应的像素半径
   margin_px: 5.0       # 判定余量：离圆边至少 5px 才算进去
-  # 真值模式用三维坐标（和 /object/pose 同一个世界坐标系，单位米）
-  xy_m: [0.20, 0.00]
-  radius_m: 0.035      # 杯口内径半径
-  height_m: 0.09       # 杯口高度，方块必须低于这个值
+  # 真值模式只需要内径：杯口位置/高度、方块边长都从 /object/pose 拿
+  radius_m: 0.035      # 杯口内径半径（米）
 
 cube:
   # 红色方块，色相跨 0 度，所以分两段

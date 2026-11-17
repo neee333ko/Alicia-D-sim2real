@@ -3,7 +3,7 @@
 > 目标：从单任务实机 ACT，演进到「多任务 / 多物体 / 仿真预训练 / 真机闭环」的工程化系统。
 > 前置：实机链路已跑通（真机 + 相机 + SDK + LeRobot 数据集 + ACT 训练，在 2080 那台）；仿真环境已装好（Isaac Sim 5.1 + Isaac Lab 2.3.2，在 3090 那台）。
 > 总周期：一人全职约 4~5 个月（含 ROS 2 改造）。
-> 更新：2026-11-12
+> 更新：2026-11-13
 
 ---
 
@@ -22,6 +22,19 @@
 | 判定方式 | 未定 | **只用视觉，真机仿真同一套** | 仿真读真值会和真机不可比 |
 | 时序 | 写在 policy 里 | **拆出 `action_executor`** | 换模型不影响执行策略 |
 | 频率 | 未定 | **全链路 30Hz** | 相机/关节/动作必须同一个 fps |
+
+实现过程中对本方案的修订（2026-11-12 ~ 11-16）：
+
+| 项 | 原方案 | 现状 | 原因 |
+|---|---|---|---|
+| 专家接口 | `/expert/run_once` 用 `std_srvs/Trigger` | **action `RunOnce`** | 抓取+放置是长动作，需要进度反馈与可取消 |
+| 物体位姿 | 启动参数写死杯子/方块位置 | **订阅 `/object/pose` 真值**（`ObjectPose`） | 每个试次方块位置都变，参数化会抓到上一轮的位置 |
+| `/sim/reset` | 独立服务只做机械臂复位 | **并入 `/sim/place`** | 拆开会出现「方块已摆、臂未回零」的中间态 |
+| `/expert/home` | 独立复位服务 | **删除**，收尾由 `/sim/place` 负责 | 同一件事两个入口 |
+| 判定模式 | 只用视觉 | **`judge` 二选一：`vision` / `ground_truth`** | 单目分不出「在杯里」和「悬在杯口上方」；仿真有真值，判得最准。跨环境比较仍统一用 `vision` |
+| `/task/instruction` | 任务级指令话题 | **删除** | v1 只有一个任务，detector 不再读任务名 |
+| `/detector/condition` | 实时布尔话题 | **删除** | 和 `/orch/result` 表达同一件事，且全仓库无人订阅 |
+| 下游状态 | 编排方逐个探测 | **各节点发 `/{node}/status`（5Hz，latched）** | 发布者自己上报，见 5.8 |
 
 ---
 
@@ -52,7 +65,7 @@
 ├── policy_node       ACT / SmolVLA 推理
 ├── success_detector  成功判定
 ├── recorder_node     写 LeRobot 数据集
-└── eval_orchestrator 评测编排
+└── orchestrator       评测编排
 ```
 
 `sim_app` 和 `sim_bridge` 是两个进程：Isaac Sim 只支持 py3.11，ROS Humble 是 py3.10，同进程 import 不了。
@@ -64,8 +77,8 @@
 - `policy_node` 只依赖 `/joint_states` 与 `/camera/*/image_raw`，不感知底层是真是假
 - `driver_node` 是**唯一**允许 `import` SDK 的地方。任何其他节点里出现 SDK 调用，一进仿真就废
 - `recorder_node` 独立订阅，驱动/相机异常不影响已录制数据
-- `success_detector` 自动判定，`eval_orchestrator` 编排整轮评测，无需人工
-- `action_executor` 是唯一按 30Hz 发 `/joint_commands` 的节点；`policy_node` 只产 chunk，不管时序
+- `success_detector` 自动判定，`orchestrator` 编排整轮评测，无需人工
+- `/joint_commands` 只有一个主动发布者：策略模式是 `action_executor`，专家模式是 `sim_expert`，两者不并存；`policy_node` 只产 chunk，不管时序
 - 判定只用视觉，真机仿真同一套；仿真真值只做离线对拍
 
 ### 2.3 设计原则
@@ -128,10 +141,11 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 | `camera_node` | 2080 | `alicia/camera:1.0` | ✅ 用官方 `v4l2_camera` + launch + 参数，没写自研节点；未在真机跑 |
 | `action_executor` | 2080 | `alicia/base:1.0` | ✅ 已实现，假机械臂验证过 30Hz 派发和重连 |
 | `policy_node` | 2080 | `alicia/policy:1.0` | ✅ 已实现；没有真 checkpoint，没跑通过一次完整推理 |
-| `success_detector` | 2080 | `alicia/base:1.0` | ✅ 已实现，合成图像验证过成功/超时路径 |
-| `sim_bridge` | 3090 | `alicia/base:1.0` | ✅ 已实现，假 sim_app 验证过协议和断线重连 |
+| `success_detector` | 2080 | `alicia/base:1.0` | ✅ 已实现 `vision` / `ground_truth` 两种判据与 `/detector/status`；合成图像验证过成功/超时路径 |
+| `sim_bridge` | 3090 | `alicia/base:1.0` | ✅ 已实现 `/sim/setup`、`/sim/place`、`ObjectPose` 发布、`/sim/status`；假 sim_app 验证过协议和断线重连。指令的服务端还要等 `sim_app` |
+| `sim_expert` | 3090 | `alicia/driver:1.0` | ✅ action server + `/expert/status`；轨迹由 `/object/pose` 真值生成，容器内 27 例通过 |
 | `recorder_node` | 2080 | — | ⬜ 未实现 |
-| `orchestrator`（旧称 `eval_orchestrator`） | 2080 / 3090 | `alicia/base:1.0` | ✅ 编排、服务、状态检查、abort 已实现并在容器内测通；下游节点尚未对接（见 5.12） |
+| `orchestrator`（旧称 `eval_orchestrator`） | 2080 / 3090 | `alicia/base:1.0` | ✅ 编排、服务、状态检查、abort 已实现并在容器内测通；下游已对接 sim / expert / detector 三路状态，recorder 未建（见 5.12） |
 | `sim_app` | 3090 | 宿主 conda `robot_sim`（py3.11） | ⬜ 未实现 |
 | `sim_scene` | 3090 | — | ⬜ 未实现 |
 | `robot_state_publisher` | 2080 | 现成 ROS 包 | ⬜ 未接入 |
@@ -144,8 +158,8 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 
 | 话题 | 类型 | 发布者 | 订阅者 |
 |---|---|---|---|
-| `/joint_states` | `sensor_msgs/JointState`（6 关节 + 夹爪） | driver_node / sim_bridge | policy、executor、detector、recorder |
-| `/joint_commands` | `std_msgs/Float64MultiArray`（7 维） | **action_executor** | driver_node / sim_bridge |
+| `/joint_states` | `sensor_msgs/JointState`（6 关节 + 夹爪） | driver_node / sim_bridge | policy、executor、detector、recorder、sim_expert（闭环等到位） |
+| `/joint_commands` | `std_msgs/Float64MultiArray`（7 维） | **action_executor** / sim_expert | driver_node / sim_bridge |
 | `/policy/infer_request` | `std_msgs/Empty`（reliable, depth 1） | action_executor | policy_node |
 | `/policy/action_chunk` | `std_msgs/Float64MultiArray`（`[stamp, n, 7×n]`，reliable + volatile + depth 1） | policy_node | action_executor |
 | `/exec/status` | `std_msgs/String`（JSON，5Hz） | action_executor | 人 / recorder（可选） |
@@ -154,10 +168,11 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 | `/camera/wrist/image_raw` | `sensor_msgs/Image` | 同上 | policy、recorder |
 | `/camera/wrist/camera_info` | `sensor_msgs/CameraInfo` | 同上 | policy、recorder |
 | `/detector/mask` | `sensor_msgs/Image`（mono8，有人订阅才发） | success_detector | 人（调阈值） |
-| `/task/instruction` | `std_msgs/String`（transient_local） | eval_orchestrator | policy、detector |
-| `/orch/trial` | `std_msgs/String`（JSON：id + event，transient_local） | eval_orchestrator | recorder、detector |
-| `/object/pose` | `geometry_msgs/PoseStamped`（仿真真值） | sim_bridge | detector（只对拍，不判定） |
-| `/detector/condition` | `std_msgs/Bool`（实时状态，变化才发） | success_detector | 人（调试） |
+| `/orch/trial` | `std_msgs/String`（JSON：id + event，transient_local） | orchestrator | recorder、detector |
+| `/object/pose` | `alicia_interfaces/ObjectPose`（仿真真值：杯口中心、杯高、方块中心、边长） | sim_bridge | sim_expert、detector（`ground_truth` 判据；`vision` 模式下不读） |
+| `/sim/status` | `std_msgs/String`（JSON，5Hz，transient_local） | sim_bridge | orchestrator |
+| `/expert/status` | `std_msgs/String`（JSON，5Hz，transient_local） | sim_expert | orchestrator |
+| `/detector/status` | `std_msgs/String`（JSON，5Hz，transient_local） | success_detector | orchestrator |
 | `/orch/result` | `std_msgs/String`（JSON，每次试次一条，带 id；**唯一结论出口**） | success_detector | orchestrator、recorder |
 | `/tf`、`/tf_static` | `tf2_msgs/TFMessage` | robot_state_publisher / sim_bridge | rviz |
 | `/rosout` | `rcl_interfaces/Log` | 所有节点 | 自动发布 |
@@ -166,13 +181,23 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 
 | 服务 | 类型 | 提供方 | 状态 |
 |---|---|---|---|
-| `/arm/home` | `std_srvs/Trigger` | driver_node / sim_bridge | ✅ 开始动就返回，不等到位 |
+| `/arm/home` | `std_srvs/Trigger` | driver_node | ✅ 开始动就返回，不等到位。sim_bridge 不提供，仿真侧的复位并入 `/sim/place` |
 | `/exec/start` / `/exec/stop` | `std_srvs/Trigger` | action_executor | ✅ |
 | `/record/start` / `/record/stop` | — | recorder_node | ❌ 已删除，改由 `/orch/trial` 的 begin/end 驱动 |
 | `/orch/start` / `/orch/stop` / `/orch/abort` | `std_srvs/Trigger` | orchestrator | ✅ 已实现 |
-| `/sim/setup` | 自定义 `Setup.srv`（cup_x/cup_y/cup_z） | sim_bridge | ⬜ 待实现 |
-| `/sim/place` | 自定义 `Place.srv`（x/y/z） | sim_bridge | ⬜ 待实现。一次完成「摆方块 + 机械臂复位」，原子返回 |
-| `/expert/run_once` | action `RunOnce` | sim_expert | ❌ 现为 Trigger 服务，待改成 action |
+| `/sim/setup` | 自定义 `Setup.srv`（cup_x/cup_y/cup_z） | sim_bridge | ✅ bridge 侧已实现（转发 `CMD_SETUP`）；服务端待 `sim_app` |
+| `/sim/place` | 自定义 `Place.srv`（x/y/z） | sim_bridge | ✅ bridge 侧已实现（转发 `CMD_PLACE`）；一次完成「摆方块 + 机械臂复位」，原子返回 |
+| `/expert/run_once` | action `RunOnce` | sim_expert | ✅ 已实现，goal `{id}`、feedback `{phase, progress}`、result `{success, message, duration_s}` |
+
+自定义消息在 `alicia_interfaces`：
+
+| 接口 | 字段 |
+|---|---|
+| `ObjectPose.msg` | `header`、`cup_pose`（杯口中心）、`cup_height`、`cube_pose`（几何中心）、`cube_edge_m` |
+| `RunOnce.action` | goal `int32 id`；result `bool success, string message, float32 duration_s`；feedback `string phase, float32 progress` |
+
+`ObjectPose` 的 `header.stamp` 是采集时刻。**`/sim/place` 返回 success 之前，sim_bridge 必须已经把新方块的 `/object/pose` 至少发过一次**——expert 在轨迹开头只读一次位姿，否则会抓到上一试次的位置。
+
 
 ### 4.4 约定
 
@@ -182,15 +207,15 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
   - `ground_truth` 是唯一能真正区分"在杯里"和"悬在杯口上方"的判据——单目做不到。适合仿真数据生成和仿真内评测。
   - **跨环境比较时必须都用 `vision`**：A/B 对照里如果仿真用真值、真机用视觉，两个成功率不是同一个量，差异会被误读成 sim2real 差距。
   - 每条 `/orch/result` 都带 `judge` 字段，事后能分清哪个数是用哪种判据测的。
-- **判定相关的两个话题分工**：`/task/instruction` 决定"判什么"（任务级），`/orch/trial` 决定"什么时候判"（试次级）。detector 两个都订阅。
-- **结论只有一个出口**：`/orch/result`。不再提供布尔版的 `/eval/success`——两个话题表达同一件事，迟早有人给它们统计出两个数。实时状态在 `/detector/condition`（一个试次里可能变很多次），不要拿它统计成功率。
-- **`/arm/home` 是"开始动"不是"已到位"**。调用方要自己轮询 `/joint_states` 等它到位。
-- **时间戳一律用 ROS 时钟**（`get_clock().now()`），不用 `time.time()`。chunk 的 stamp 来自相机/仿真的 `header.stamp`，`action_executor` 也用同一个源比较。混用会让 chunk 全被判过期，表现是"策略在推理但机械臂不动"。
+- **`/orch/trial` 决定"什么时候判"**（试次级）。v1 只有一个任务，没有任务级指令话题；判据由 `calib/detector.yaml` 的 `judge` 选。
+- **结论只有一个出口**：`/orch/result`。不再提供布尔版的 `/eval/success`，也没有 `/detector/condition`——多个话题表达同一件事，迟早有人给它们统计出两个数。
+- **`/arm/home` 是"开始动"不是"已到位"**（只有 driver_node 提供；仿真侧复位并入 `/sim/place`）。调用方要自己轮询 `/joint_states` 等它到位。
+- **时间戳一律用 ROS 时钟**（`get_clock().now()`），不用 `time.time()`。chunk 的 stamp 来自相机/仿真的 `header.stamp`，`action_executor` 也用同一个源比较。混用会让 chunk 全被判过期，表现是"策略在推理但机械臂不动"。唯一例外是 `/{node}/status` 的 `stamp`：它用墙钟 `time.time()`，因为 orchestrator 也是用 `time.time()` 算年龄；跟 ROS 时钟混用会在仿真的 `/clock` 停住时把所有节点判成失联。
 - **所有消息必须填 `header.stamp`**（采集时刻，不是发布时刻）。
 - **观测对齐**：三路各缓存 5 帧，以最新图像为锚，关节状态取离锚点最近的一帧，相差 ≤ 一帧（33ms）即同一时刻；找不到就跳过，由 executor 在 150ms 后重发。
 - **给 `uint8[]` 字段赋值必须用 `array.array("B", data)`，不能直接赋 `bytes`**。rclpy 会对 `bytes` 做逐元素校验，921KB 从 3000+ fps 掉到 6.6 fps，而且不报错。
 - **图像 QoS 用 best_effort**：丢一帧不影响策略，reliable 会在丢包时把相机节点堵住。
-- **`/task/instruction`、`/orch/trial` 用 transient_local**，后启动的节点也能拿到最后一条。发布方必须用同样的 durability，否则 QoS 不兼容、根本匹配不上。
+- **`/orch/trial` 与各 `/{node}/status` 用 transient_local**，后启动的节点也能拿到最后一条。发布方必须用同样的 durability，否则 QoS 不兼容、根本匹配不上。
 
 ### 4.5 关键参数
 
@@ -229,7 +254,8 @@ success_detector:
 | `/joint_states`、`/joint_commands`、`/object/pose` | reliable | volatile | 5~10 |
 | `/policy/action_chunk` | reliable | volatile | 1 |
 | `/policy/infer_request` | reliable | volatile | 1 |
-| `/task/instruction`、`/orch/trial` | reliable | **transient_local** | 1 |
+| `/orch/trial` | reliable | **transient_local** | 10 |
+| `/{node}/status` | reliable | **transient_local** | 1 |
 
 ---
 
@@ -333,9 +359,11 @@ run_trial(idx, x, y)
 | `check_nodes` 逐个探测 | 2s / 个 | 服务与 action 两套发现机制都要探 |
 | `/sim/setup` | 5s | 一轮一次 |
 | `/sim/place` | 10s | 每试次一次；要摆方块 + 回零位两件事，故比 setup 宽 |
+| sim_bridge 内部等确认 | 9s | `place_timeout_s`。对 `/sim/place` 而言短于 10s；但对 `/sim/setup` 的 5s 客户端超时来说偏长，见 5.12 |
 | action 发送 goal | 5s | 服务端没起来或满载 |
 | action 等 result | 60s | 脚本专家的完整抓取+放置 |
 | 等判定 | `trial_timeout_s`（task.yaml，默认 20s） | 试次级，独立于专家超时 |
+| `success_detector` 内部 | `timeout_s`（detector.yaml，默认 15s） | 从收到 `begin` 起算，必须小于 `trial_timeout_s` |
 | 状态过期 | `status_timeout_s`（默认 3s） | 超过就算失联 |
 | 等就绪 | `ready_wait_s`（默认 3s） | 有界轮询，50ms 一次 |
 | cancel 后等确认 | 2s | 不无限等，见 5.9 |
@@ -356,13 +384,12 @@ run_trial(idx, x, y)
 
 ```
 /{sim|expert|recorder|detector}/status   std_msgs/String, JSON
-{"node": "recorder", "liveness": true, "readiness": true,
- "state": "idle", "stamp": 1699999999.0, "detail": ""}
+{"stamp": 1699999999.0, "liveness": true, "readiness": true, "state": "idle"}
 ```
 
 - QoS：reliable + transient_local + keep_last 1。后启动的 orchestrator 也能立刻拿到最新一条。
-- 发布时机：状态变化时立刻发一次，其余周期发（建议 1Hz）。
-- `node` 字段**以话题名为准**，不信消息体里的名字——发布方写错不该让状态串到别人身上；JSON 解析失败不覆盖上一条。
+- 发布时机：定时 5Hz（`status_timeout_s` 是 3s，留足抖动余量），状态变化在下一拍就会反映。
+- **消息体里不带 `node` 字段**，节点身份以话题名为准，orchestrator 收到后自己按话题名补；JSON 解析失败不覆盖上一条。
 - 三种故障分开报，不都归成“没状态”：
 
 | 检查 | 判据 | 含义 |
@@ -370,6 +397,8 @@ run_trial(idx, x, y)
 | 失联 | `now - stamp > status_timeout_s` | 节点挂了、卡死或网络断了 |
 | 失活 | `liveness=false` | 进程在但内部子系统坏了（相机打不开、串口断了） |
 | 未就绪 | `readiness=false` | 活着但腾不出手（recorder 还在写盘、expert 还在上一次动作里） |
+
+三路已实现的附加字段（诊断用，不参与就绪判断）：`/sim/status` 的 `joint_age_s`；`/expert/status` 的 `episode`、`has_pose`；`/detector/status` 的 `episode`、`judge`、`has_truth`。
 
 ### 5.9 abort 为什么必须两端配合取消
 
@@ -379,6 +408,8 @@ run_trial(idx, x, y)
 2. **execute 回调必须周期性检查 `goal_handle.is_cancel_requested`**，否则请求被接受也不会真的停下来。
 
 两条缺一条，表现都是“点了 abort，机械臂继续做完”。另外 cancel 与 feedback 有竞态：cancel 先到时 `publish_feedback` 会抛“发布器已失效”，服务端要包异常并复查 `is_cancel_requested`。
+
+`sim_expert` 已按这两条实现：`cancel_callback` 返回 `ACCEPT`；`_move_to` 的插值、到位等待、夹爪保持三段循环每 33ms 查一次，`_run_sequence` 在每个 keyframe 之间也查一次，最坏响应一个控制周期。取消收尾走 `goal_handle.canceled()`，外部看到的是 `CANCELED` 而不是 `ABORTED`。
 
 ### 5.10 试次位置与参数
 
@@ -414,20 +445,30 @@ ros2 service call /orch/abort std_srvs/srv/Trigger   # 立即中断
 
 ### 5.12 测试与当前缺口
 
-容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 44 个用例：25 个纯逻辑（状态检查、结果过滤、服务状态机，绕过 `__init__` 注入字段）+ 19 个集成（起真 `Orchestrator` 节点 + 假下游，覆盖服务成功/失败/超时、abort 真 cancel、begin/end 顺序、摆位失败、未就绪跳过、汇总输出）。
+容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 71 个用例：
+
+- 25 个 orchestrator 纯逻辑：状态检查、结果过滤、服务状态机（绕过 `__init__` 注入字段）
+- 19 个 orchestrator 集成：起真 `Orchestrator` + 假下游，覆盖服务成功/失败/超时、abort 真 cancel、begin/end 顺序、摆位失败、未就绪跳过、汇总输出
+- 27 个 `sim_expert`：IK 守卫与跳解拦截、插值与限速、到位/断流/取消、夹爪保持、keyframe 目标推算、action 收尾四条路径
+
+`sim_bridge` 与 `success_detector` 没有自动化用例：前者靠假 sim_app 手工验证协议，后者靠合成图像验证判定路径。
 
 ```bash
-pytest tests -q     # 需 source /ws/install/setup.bash
+docker run --rm -e ROS_DOMAIN_ID=77 -v $PWD:/ws -w /ws alicia/driver:1.0 bash -lc \
+  "source /opt/ros/humble/setup.bash && \
+   colcon build --packages-select alicia_interfaces --build-base /tmp/b --install-base /tmp/i >/dev/null && \
+   source /tmp/i/setup.bash && python3 -m pytest tests -q"
 ```
 
 尚未对接的部分：
 
 | 项 | 现状 |
 |---|---|
-| `/expert/run_once` | `sim_expert` 仍是 Trigger 服务，与 action 客户端类型不匹配 → 改为 action server（含 5.9 的两条取消要求） |
-| `/sim/setup`、`/sim/place` | `sim_bridge` 未实现；socket 协议需要加 `CMD_SETUP` / `CMD_PLACE` / `PLACE_DONE`。`/sim/place` 要在仿真侧串行做完「摆方块 → 回零位」，两者都到位才返回 success |
-| `/{node}/status` | 四个下游都还没发布 |
+| `sim_app` | 未实现 `0x01` 场景同步 / `0x02` 摆放方块；必须先发新的 `type=4` 真值再发 `type=5` 确认。注意 `cup_pose.z` 必须是**杯口高度**，而 task.yaml 的 `spawn.cup.center` z 是杯体中心 |
+| `/{node}/status` | `sim`、`expert`、`detector` 已按 5.8 发布；`recorder` 未建，非 `dry_run` 下 `check_ready` 会恒报 `recorder: no_status` |
 | `recorder_node` | 未实现，需要 idle→recording→idle 状态机 + status |
+| `sim_bridge` 超时 | `_request` 对 setup / place 共用 9s，而 orchestrator 对 `/sim/setup` 只等 5s，违反 5.6 的「客户端 > 服务端」；应拆成两个参数 |
+| 判定样本新鲜度 | 判据不检查 `/object/pose` 的采样时刻，位姿流断掉后旧坐标仍参与 `_settled` 与 hold，理论上可判出「假成功」。当前按"不过度保护"取舍，未加防护 |
 
 ---
 
@@ -518,10 +559,10 @@ C（加）：40 真机 + 200 仿真混合训练 → 真机测 50 次
 
 #### 评测自动化（与阶段 2 同步，优先级最高）
 
-`eval_orchestrator` 状态机：
+`orchestrator` 状态机（旧称 `eval_orchestrator`）：
 
 ```
-选场景 → /eval/reset → 策略运行 → success_detector 判定
+选场景 → /sim/setup → /sim/place（摆方块+复位） → /expert/run_once → success_detector 判定
       → 录制落盘 → 自动记录标签 → 下一轮
 ```
 
@@ -583,7 +624,7 @@ C（加）：40 真机 + 200 仿真混合训练 → 真机测 50 次
 
 | 环节 | 现有组件 | 目标形态 |
 |---|---|---|
-| 评测 | `eval.sh` | `eval_orchestrator` 节点 |
+| 评测 | `eval.sh` | `orchestrator` 节点 |
 | 失败记录 | `failure_logs/` | 自动分类 + 标签 |
 | 纠正 | `corrective_demos_v1/` | 接管录制节点 |
 | 训练 | `lerobot-train` | `retrain.sh` + 版本管理 |
@@ -627,9 +668,11 @@ pi/
 │   ├── act_policy_node/policy_node.py
 │   ├── success_detector/success_detector.py
 │   ├── sim_bridge/sim_bridge.py
+│   ├── sim_expert/sim_expert.py            # 脚本专家，RunOnce action
 │   ├── orchestrator/orchestrator_node.py   # 编排中心（见第 5 节）
-│   ├── alicia_interfaces/{srv/Setup.srv, srv/Place.srv, action/RunOnce.action}
+│   ├── alicia_interfaces/{srv/Setup.srv, srv/Place.srv, action/RunOnce.action, msg/ObjectPose.msg}
 │   └── recorder_node/          # ⬜ 未建
+├── tests/                      # 容器内 pytest：orchestrator + sim_expert
 ├── scripts/                    # ⬜ 待建：record/train/eval 的入口
 ├── sim_test/                   # 仿真环境验证脚本
 │   ├── smoke_isaaclab.py
@@ -658,17 +701,18 @@ pi/
 | `driver_node` | dry_run：限位、速度限幅、NaN 拦截、看门狗、`/arm/home` 流程 |
 | `action_executor` | 假机械臂：30Hz 派发、按时间请求 chunk、时间戳对齐、断线重连 |
 | `policy_node` | 未跑通（没有真 checkpoint）；接口和观测对齐逻辑写完 |
-| `success_detector` | 合成图像：成功路径 2.1s 出结果，超时/手动结束路径 |
-| `sim_bridge` | 假 sim_app：协议往返、关节 30Hz、图像吞吐、断线重连 |
+| `success_detector` | 合成图像：成功路径 2.1s 出结果，超时/手动结束路径；`ground_truth` 判据与 `/detector/status` 已实现，未运行验证 |
+| `sim_bridge` | 假 sim_app：协议往返、关节 30Hz、图像吞吐、断线重连；`/sim/setup`、`/sim/place`、`ObjectPose`、`/sim/status` 已实现，未运行验证 |
 | 相机启动 | launch + 参数 + udev + 标定模板，未接真机 |
-| `orchestrator` | 容器内真 ROS：44 个用例（纯逻辑 + 假下游集成），覆盖服务失败/超时、abort 真 cancel、begin/end 顺序、未就绪跳过、汇总输出 |
+| `orchestrator` | 容器内真 ROS：44 个用例（25 纯逻辑 + 19 假下游集成），覆盖服务失败/超时、abort 真 cancel、begin/end 顺序、未就绪跳过、汇总输出 |
+| `sim_expert` | 27 个用例（假 IK + 桩 sleep）：IK 跳解拦截、插值限速、断流与取消、夹爪保持、action 四条收尾路径 |
 | 镜像 | base / driver / camera / policy 四个都构建通过 |
 
 ### 已知未做（按优先级）
 
 1. **真机上跑通 camera + driver**：设备名固定、内参标定、串口确认。这是所有真机数据的入口。
 2. **`recorder_node`**：写 LeRobot 数据集。没有它就没有训练数据。
-3. **下游对接编排契约**（详见 5.12）：`sim_expert` 改 action server、`sim_bridge` 实现 `/sim/setup` 与「摆方块+复位」的 `/sim/place`、四个节点发布 `/{node}/status`。
+3. **下游对接编排契约**（详见 5.12）：`sim_app` 实现 `0x01/0x02` 指令并保证 `type=4` 先于 `type=5`；`recorder_node` 补实现与 `/recorder/status`（其余三路状态已就绪）。
 4. **`sim_app` + `sim_scene`**：Isaac Lab 场景、关节映射、脚本专家生成数据。
 5. **`pi/policy` 镜像重建**：Dockerfile 已改成 `FROM alicia/base`，但现有镜像是旧的。
 6. **`ActionChunk.msg` 消息包**：现在 chunk 挤在 `Float64MultiArray` 里。

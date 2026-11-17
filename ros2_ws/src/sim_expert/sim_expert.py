@@ -15,6 +15,7 @@ recorder 录不到 action 字段。真机是"人 → /joint_commands → 臂"，
   订阅  /joint_states    当前关节角（闭环等到位）
         /object/pose     杯子与方块真值（alicia_interfaces/ObjectPose）
   发布  /joint_commands  30Hz 关节目标（7 维：6 弧度 + 夹爪 0~1）
+        /expert/status   5Hz JSON（stamp/liveness/readiness/state/episode）
   动作  /expert/run_once 生成一条示范（RunOnce，可取消，带进度反馈）
 
     python3 sim_expert.py --ros-args -p rate_hz:=30.0
@@ -22,6 +23,7 @@ recorder 录不到 action 字段。真机是"人 → /joint_commands → 臂"，
 
 from __future__ import annotations
 
+import json
 import math
 import time
 
@@ -33,8 +35,9 @@ from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 
 JOINT_NAMES = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
 
@@ -113,6 +116,17 @@ class SimExpert(Node):
 
         # ---- 接口 ----------------------------------------------------------
         self.pub = self.create_publisher(Float64MultiArray, "/joint_commands", 10)
+        # 状态用 latched：orchestrator 后启动也能立刻拿到最后一条，不必等下一拍
+        self.pub_status = self.create_publisher(
+            String,
+            "/expert/status",
+            QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
+        )
         self.create_subscription(JointState, "/joint_states", self.on_state, 10)
         self.create_subscription(ObjectPose, "/object/pose", self.on_object, 10)
         cb = ReentrantCallbackGroup()
@@ -127,6 +141,8 @@ class SimExpert(Node):
         )
 
         self.create_timer(self.dt, self.publish_cmd)
+        # orchestrator 的 status_timeout_s=3.0，5Hz 足够，也留足网络抖动余量
+        self.create_timer(0.2, self._publish_status)
         self.get_logger().info(
             f"sim_expert 就绪：速度 {self.speed} rad/s，{self.rate:.0f}Hz，"
             "等 /object/pose 给出杯子与方块位姿"
@@ -151,6 +167,18 @@ class SimExpert(Node):
         msg = Float64MultiArray()
         msg.data = [float(v) for v in self.cmd]
         self.pub.publish(msg)
+
+    def _publish_status(self):
+        """给 orchestrator 的就绪检查用：忙时 readiness=false，别让新 goal 排队。"""
+        payload = {
+            "stamp": time.time(),
+            "liveness": True,
+            "readiness": not self.busy,
+            "state": "running" if self.busy else "idle",
+            "episode": int(self.goal.request.id) if self.goal is not None else -1,
+            "has_pose": None not in (self.cube, self.cup, self.cube_edge),
+        }
+        self.pub_status.publish(String(data=json.dumps(payload)))
 
     def on_goal(self, goal_handle):
         """执行一条示范。execute 回调，跑在 executor 的独立线程里。"""

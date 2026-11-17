@@ -17,18 +17,16 @@
 话题/服务
   订阅  /camera/front/image_raw    sensor_msgs/Image（rgb8）
         /joint_states             sensor_msgs/JointState（只取夹爪开度，第 7 维）
-        /object/pose              geometry_msgs/PoseStamped（仿真真值，调试对拍用）
-        /task/instruction         std_msgs/String（决定"判什么"，任务级）
-        /orch/trial              std_msgs/String（决定"什么时候判"，试次级）
-  发布  /detector/condition       std_msgs/Bool：**实时状态**，判定条件此刻成立与否。
-                                条件变化才发，一个试次里可能变很多次。调试用。
-        /orch/result              std_msgs/String：**试次结论**，每个试次恰好一条，带 id。
+        /object/pose              alicia_interfaces/ObjectPose（仿真真值，调试对拍用）
+        /orch/trial               std_msgs/String（决定"什么时候判"，试次级）
+  发布  /orch/result              std_msgs/String：**试次结论**，每个试次恰好一条，带 id。
                                 成功、超时、被手动结束都在这里，含原因和指标。
                                 这是唯一的结论出口，不要再加一个"布尔版"——
                                 两个话题表达同一件事，迟早有人给它们统计出两个数。
         /detector/mask            sensor_msgs/Image（mono8，调阈值时看这个）
+        /detector/status          5Hz JSON（stamp/liveness/readiness/state）
 
-语义约定：/orch/result 是结论，一个试次一条；实时状态看 /detector/condition。
+语义约定：/orch/result 是唯一出口，一个试次一条。
 
 本节点不提供任何服务：试次开始/结束是一对多事件（recorder 要录、detector 要判），
 用话题广播，不用服务挨个调。
@@ -49,11 +47,11 @@ import time
 import numpy as np
 import rclpy
 import yaml
-from geometry_msgs.msg import PoseStamped
+from alicia_interfaces.msg import ObjectPose
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 
 JOINT_NAMES = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
 
@@ -121,10 +119,8 @@ class SuccessDetector(Node):
         self.cup_c = (float(cup["center_px"][0]), float(cup["center_px"][1]))
         self.cup_r = float(cup["radius_px"]) - float(cup.get("margin_px", 0))
 
-        # 真值模式要用的三维几何：杯心（世界坐标，米）、内径半径、杯口高度
-        self.cup_xy_m = tuple(float(v) for v in cup.get("xy_m", [0.0, 0.0]))
+        # 真值模式只从配置取杯内径：杯口位置、杯口高度、方块边长都来自 /object/pose
         self.cup_r_m = float(cup.get("radius_m", 0.035))
-        self.cup_h_m = float(cup.get("height_m", 0.09))
 
         cube = self.cfg["cube"]
         self.hsv_ranges = list(zip(cube["ranges_lower"], cube["ranges_upper"]))
@@ -143,12 +139,12 @@ class SuccessDetector(Node):
         self.gripper = None
         self.dist_px = float("inf")      # 视觉模式：到杯口圆心的像素距离
         self.cube_2d = None              # 视觉模式：(cx, cy, t, area)
-        self.cube_3d = None              # 真值模式：(x, y, z, t)
+        self.cube_3d = None              # 真值模式：(x, y, z, t)，方块几何中心
+        self.cube_edge = None            # 方块边长，判"整体低于杯口"要用
+        self.cup_gt = None               # 杯口中心（世界坐标），z 就是杯口高度
         self.dist_m = float("inf")
         self.gt_pose = None
-        self.success_latch = False
         self.episode_id = -1
-        self.task = ""
 
         # ---- 内部时钟：判定用的是耗时，不跟 ROS 时钟绑定 -------------------
         self.qos_img = QoSProfile(
@@ -157,26 +153,12 @@ class SuccessDetector(Node):
             depth=5,
         )
 
-        self.pub_condition = self.create_publisher(
-            Bool,
-            "/detector/condition",
-            QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.VOLATILE,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=1,
-            ),
-        )
         self.pub_result = self.create_publisher(String, "/orch/result", 10)
         self.pub_mask = self.create_publisher(Image, "/detector/mask", self.qos_img)
-
-        self.create_subscription(Image, "/camera/front/image_raw", self.on_image, self.qos_img)
-        self.create_subscription(JointState, "/joint_states", self.on_state, 10)
-        self.create_subscription(PoseStamped, "/object/pose", self.on_object, 10)
-        self.create_subscription(
+        # 状态用 latched：orchestrator 后启动也能立刻拿到最后一条
+        self.pub_status = self.create_publisher(
             String,
-            "/task/instruction",
-            self.on_instruction,
+            "/detector/status",
             QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -184,6 +166,10 @@ class SuccessDetector(Node):
                 depth=1,
             ),
         )
+
+        self.create_subscription(Image, "/camera/front/image_raw", self.on_image, self.qos_img)
+        self.create_subscription(JointState, "/joint_states", self.on_state, 10)
+        self.create_subscription(ObjectPose, "/object/pose", self.on_object, 10)
         self.create_subscription(
             String,
             "/orch/trial",
@@ -198,6 +184,8 @@ class SuccessDetector(Node):
 
         # 判定独立成定时器：仿真用真值时可能根本没有图像流
         self.create_timer(1.0 / 30.0, self._evaluate)
+        # orchestrator 的 status_timeout_s=3.0，5Hz 足够，也留足网络抖动余量
+        self.create_timer(0.2, self._publish_status)
 
         self.get_logger().info(
             f"success_detector 就绪（{self.judge}）：杯口 ({self.cup_c[0]:.0f},{self.cup_c[1]:.0f}) r={self.cup_r:.0f}px，"
@@ -210,21 +198,6 @@ class SuccessDetector(Node):
             return
         self.joints = [float(v) for v in msg.position[:6]]
         self.gripper = float(msg.position[6])
-
-    def on_instruction(self, msg: String):
-        """任务级指令：决定用哪套判据。v1 只有一套，任务名对不上就告警。
-
-        以后多任务时，这里按 task 切到不同的 cup/cube 参数组（读不同的配置段）。
-        """
-        self.task = msg.data.strip()
-        expected = self.cfg.get("task", "cube_into_cup")
-        if self.task and self.task != expected:
-            self.get_logger().warn(
-                f"当前任务指令「{self.task}」和配置里的「{expected}」不一致，"
-                f"仍按配置的判据执行"
-            )
-        else:
-            self.get_logger().info(f"任务：{self.task or expected}")
 
     def on_episode(self, msg: String):
         """试次生命周期由 orchestrator 广播：
@@ -243,11 +216,14 @@ class SuccessDetector(Node):
             self.t_start = time.monotonic()
             self.hold_since = None
             self.settle_hist.clear()
-            self.success_latch = False
             self.cube_2d = None
+            # 真值缓存也要清：残留的上一试次位置会让新试次开头直接判成功
+            self.cube_3d = None
+            self.cube_edge = None
+            self.cup_gt = None
+            self.gt_pose = None
             self.dist_px = float("inf")
             self.dist_m = float("inf")
-            self._publish_condition(False)
             self.get_logger().info(f"开始判断试次 #{ep_id}")
         elif event == "end":
             if self.watching:
@@ -259,6 +235,10 @@ class SuccessDetector(Node):
     # ---------------------------------------------------------------- 观测
     def on_image(self, msg: Image):
         """只负责"看到方块在哪"，不判定。判定统一在 _evaluate 里。"""
+        # 真值模式不看图像。sim 的相机也在 30Hz 发，转 HSV 一帧要几毫秒，
+        # 白占单线程 executor，还会推迟 _evaluate 的 hold 计时。
+        if self.judge != "vision":
+            return
         img = self._to_rgb(msg)
         if img is None:
             return
@@ -272,11 +252,17 @@ class SuccessDetector(Node):
         ys, xs = np.nonzero(mask)
         self.cube_2d = (float(xs.mean()), float(ys.mean()), time.monotonic(), area)
 
-    def on_object(self, msg: PoseStamped):
-        """仿真真值。ground_truth 模式用它判定；vision 模式只拿来对拍。"""
-        p = msg.pose.position
-        self.gt_pose = (p.x, p.y, p.z)
-        self.cube_3d = (p.x, p.y, p.z, time.monotonic())
+    def on_object(self, msg: ObjectPose):
+        """仿真真值。ground_truth 模式用它判定；vision 模式只拿来对拍。
+
+        每帧都带杯子和方块：杯子由 /sim/setup 定，方块由 /sim/place 摆，
+        所以判据必须用消息里的值，不能用配置文件里写死的坐标。
+        """
+        c = msg.cube_pose
+        self.cube_3d = (c.x, c.y, c.z, time.monotonic())
+        self.cube_edge = float(msg.cube_edge_m)
+        self.cup_gt = (msg.cup_pose.x, msg.cup_pose.y, msg.cup_pose.z)
+        self.gt_pose = (c.x, c.y, c.z)
 
     # ---------------------------------------------------------------- 判定
     def _evaluate(self):
@@ -293,7 +279,6 @@ class SuccessDetector(Node):
         else:
             ok = self._check_vision(now)
 
-        self._publish_condition(ok)
         if ok and self.hold_since is not None and now - self.hold_since >= self.hold_s:
             self.watching = False
             self._publish_result(True, "success")
@@ -313,14 +298,18 @@ class SuccessDetector(Node):
         """真值模式：三维距离 + 高度。
 
         这是唯一能真正区分"在杯里"和"悬在杯口上方"的判据——单目做不到。
+        杯口位置和方块边长都用 /object/pose 的当前值：它们由 /sim/setup、
+        /sim/place 决定，写死在配置里换个位置就判错。
         """
-        if self.cube_3d is None:
+        if self.cube_3d is None or self.cup_gt is None or self.cube_edge is None:
             self.dist_m = float("inf")
             return self._fail()
         x, y, z, _t = self.cube_3d
-        self.dist_m = math.hypot(x - self.cup_xy_m[0], y - self.cup_xy_m[1])
-        # 必须在杯口圈内，而且低于杯口（这一条只有真值模式能判）
-        inside = self.dist_m <= self.cup_r_m and z <= self.cup_h_m
+        self.dist_m = math.hypot(x - self.cup_gt[0], y - self.cup_gt[1])
+        # 方块**整体**低于杯口才算进去了：中心 + 半个边长 <= 杯口高度。
+        # 只比中心的话，卡在杯沿上的方块也会被判成功。
+        top = z + self.cube_edge / 2.0
+        inside = self.dist_m <= self.cup_r_m and top <= self.cup_gt[2]
         settled = self._settled(now, (x, y), self.settle_m)
         released = self.gripper is not None and self.gripper >= self.grip_open_min
         return self._hold(inside and settled and released, now)
@@ -350,13 +339,6 @@ class SuccessDetector(Node):
         return False
 
     # ---------------------------------------------------------------- 发布
-    def _publish_condition(self, ok: bool):
-        """实时状态：条件此刻成立与否。只在变化时发，避免 30Hz 刷屏。"""
-        if ok == self.success_latch:
-            return
-        self.success_latch = ok
-        self.pub_condition.publish(Bool(data=bool(ok)))
-
     def _publish_result(self, success: bool, reason: str):
         payload = {
             "id": self.episode_id,
@@ -371,6 +353,23 @@ class SuccessDetector(Node):
         }
         self.pub_result.publish(String(data=json.dumps(payload)))
         self.get_logger().info(f"试次结束：{payload}")
+
+    def _publish_status(self):
+        """给 orchestrator 的就绪检查用：stamp/liveness/readiness/state。
+
+        readiness 只表示"没在判"，可以接下一个试次。真值是否收到放在 has_truth
+        里给诊断用，不参与就绪判断——/object/pose 要到 sim_app 起来才有。
+        """
+        payload = {
+            "stamp": time.time(),
+            "liveness": True,
+            "readiness": not self.watching,
+            "state": "judging" if self.watching else "idle",
+            "episode": self.episode_id,
+            "judge": self.judge,
+            "has_truth": self.cube_3d is not None,
+        }
+        self.pub_status.publish(String(data=json.dumps(payload)))
 
     def _publish_mask(self, mask: np.ndarray, stamp):
         # 纯诊断话题：没人订阅就不发，省掉 30Hz × 300KB 的拷贝
