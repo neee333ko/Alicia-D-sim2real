@@ -1,0 +1,103 @@
+# ============================================================
+# sim_app 场景配置
+#
+# 只描述「场景里有什么、长什么样」。**不含本轮位姿**：杯子和小方块的位置
+# 由 orchestrator 每轮通过 /sim/setup、/sim/place 传到 sim_app，写在这里
+# 一定会拿到上一轮的旧位置。
+#
+# 单位一律 米 / 弧度 / 秒 / 度（字段名带 _deg 的才是度）。
+# 坐标系与 task.yaml 的 frame 一致：原点=桌面台面左前角，x 指向机器人，
+# y 向左，z 向上。
+# ============================================================
+
+# ---------- 两条 unix socket ----------
+# 必须和 sim_bridge 的 sim_cmd_sock / sim_state_sock 参数一致。
+socket:
+  cmd: /tmp/alicia_sim_cmd.sock
+  state: /tmp/alicia_sim_state.sock
+
+# ---------- 仿真节奏 ----------
+sim:
+  device: cuda:0          # 多人共用的卡上跑不动时改成 cpu，先保证能起
+  physics_hz: 60          # 物理步长，PD 位置控制的稳定性和它直接相关
+  render_hz: 30           # 相机出图频率，和全链路 30Hz 对齐
+  state_queue: 256        # state 通道待发帧上限；满了先丢图像，不丢关节/真值
+
+# ---------- 机械臂 ----------
+robot:
+  # URDF 导入时拆成了 base/physics/sensor 几个子 layer，robot.usd 是入口。
+  # 四个文件必须放在同一目录，子 layer 是按相对路径引用的。
+  usd: assets/alicia_d_zero_robot.usd
+  prim: /World/Robot
+  base_pos: [0.0, 0.0, 0.0]
+  base_yaw_deg: 0.0
+
+  # 6 个旋转关节，顺序就是 /joint_commands 前 6 维的顺序
+  joints: [Joint1, Joint2, Joint3, Joint4, Joint5, Joint6]
+
+  # 夹爪：ROS 侧 0~1 归一化，这里给出每个物理关节在 0 / 1 两端的位置。
+  # 两个手指是独立 prismatic 关节（不是 mimic），方向相反，必须一起下发。
+  gripper:
+    joints:
+      - {name: LGripper, open: 0.025, close: 0.0}
+      - {name: RGripper, open: -0.025, close: 0.0}
+
+  # 6 个关节的复位角（弧度）。文件不存在时用全零并打一条警告
+  home_pose_file: poses/reset.json
+
+  # PD 增益。刚度太低臂会垂，太高在 60Hz 下会自己抖
+  actuators:
+    arm: {stiffness: 60.0, damping: 6.0, effort_limit: 5.0}
+    gripper: {stiffness: 400.0, damping: 40.0, effort_limit: 5.0}
+
+# ---------- 桌面 ----------
+# 台面就是 z=0 平面，所以方块中心 z=0.015、杯子中心 z=0.045 才对得上
+table:
+  prim: /World/Table
+  size: [1.4, 1.0, 0.04]
+  pos: [0.55, 0.10, -0.02]
+
+# ---------- 方块 ----------
+cube:
+  prim: /World/Cube
+  edge: 0.030             # task.yaml: object.cube.size
+  mass: 0.020
+  friction: 0.8
+  color: [0.80, 0.10, 0.10]
+
+# ---------- 杯子 ----------
+# 用一圈薄板拼出空心筒，这样方块能真的掉进去；单个实心圆柱做不到。
+cup:
+  prim: /World/Cup
+  height: 0.090
+  inner_radius: 0.035     # inner_diameter 0.070
+  outer_radius: 0.039     # outer_diameter 0.078
+  wall_segments: 16       # 段数越多越圆，16 段已经不像多边形
+  bottom_thickness: 0.004
+  color: [0.85, 0.85, 0.88]
+
+# ---------- 相机 ----------
+# 分辨率 640x480、30fps 与 task.yaml 的真机配置一致。
+# 内参由 focal_length + horizontal_aperture 算出，导出给 bridge 的 K 就是它。
+camera:
+  front:
+    width: 640
+    height: 480
+    eye: [0.10, -0.30, 0.55]      # 世界坐标，桌面支架位置
+    look_at: [0.47, 0.07, 0.05]   # 看向杯子和方块的中间
+    focal_length: 24.0
+    horizontal_aperture: 36.0
+  wrist:
+    width: 640
+    height: 480
+    parent: tool0                 # 挂在夹爪末端，跟着臂一起动
+    offset_pos: [0.0, 0.0, 0.05]  # parent 坐标系下的安装偏移
+    offset_rpy_deg: [0.0, 0.0, 0.0]
+    focal_length: 18.0
+    horizontal_aperture: 36.0
+
+# ---------- place 的收尾判定 ----------
+place:
+  home_timeout_s: 4.0     # 回零位最多等这么久，超时按失败回 type=5
+  settle_tol_rad: 0.02    # 6 个关节都在这个误差内才算稳住
+  settle_hold_s: 0.20     # 稳住要持续这么久，避免在过零点上误判

@@ -35,3 +35,7 @@ build_*.log
 .env
 *.local
 udev
+
+
+# ---- 其他 ----
+assets/*
