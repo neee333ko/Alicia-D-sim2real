@@ -116,16 +116,23 @@ class SuccessDetector(Node):
             raise ValueError(f"judge 只能是 vision 或 ground_truth，收到 {self.judge}")
 
         cup = self.cfg["cup"]
-        self.cup_c = (float(cup["center_px"][0]), float(cup["center_px"][1]))
-        self.cup_r = float(cup["radius_px"]) - float(cup.get("margin_px", 0))
-
         # 真值模式只从配置取杯内径：杯口位置、杯口高度、方块边长都来自 /object/pose
         self.cup_r_m = float(cup.get("radius_m", 0.035))
 
         cube = self.cfg["cube"]
-        self.hsv_ranges = list(zip(cube["ranges_lower"], cube["ranges_upper"]))
-        self.min_area = int(cube["min_area_px"])
         self.settle_m = float(cube.get("settle_m", 0.002))
+
+        # 像素/HSV 参数只有 vision 用得上，真值模式不读，配置里也不必留
+        if self.judge == "vision":
+            self.cup_c = (float(cup["center_px"][0]), float(cup["center_px"][1]))
+            self.cup_r = float(cup["radius_px"]) - float(cup.get("margin_px", 0))
+            self.hsv_ranges = list(zip(cube["ranges_lower"], cube["ranges_upper"]))
+            self.min_area = int(cube["min_area_px"])
+        else:
+            self.cup_c = (0.0, 0.0)
+            self.cup_r = 0.0
+            self.hsv_ranges = []
+            self.min_area = 0
 
         grip = self.cfg.get("gripper", {})
         self.grip_open_min = float(grip.get("open_min", 0.8))
