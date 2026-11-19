@@ -320,3 +320,150 @@ def send_camera_info(server: FrameServer, cfg: dict) -> None:
         )
         d = (0.0, 0.0, 0.0, 0.0, 0.0)
         server.send(protocol.frame_info(cam, k, d, stamp))
+
+
+def run(cfg: dict, app) -> None:
+    """主循环：推物理、执行命令、按频率出帧，直到 Isaac 窗口关闭。
+
+    物理按 wall clock 节流到 physics_hz：SimulationContext.step() 自己不睡，
+    不节流会跑到 GPU 允许的最快速度，图像帧会把 bridge 淹没，策略的时间
+    尺度也全错。落后时直接重置节拍而不是补步，宁可慢一点也不要一次追几步。
+
+    setup/place 都要等下一轮循环才回 type=5：write_root_pose_to_sim 只写进
+    物理 buffer，data.root_pos_w 要等下一次 step 才刷新，当场读会拿到旧位姿。
+    收尾时同一轮里先发 type=4 再发 type=5，同一条 socket 是 FIFO，bridge
+    收到 success 时下游一定已经拿到新真值。
+
+    place 等待回零期间忽略关节指令：外部策略可能还在按自己的节奏发目标，
+    放进来会和复位目标互相拉扯，永远收敛不到 settle_tol 以内。
+    """
+    import scene as scene_mod
+
+    sc = scene_mod.Scene(cfg)
+    server = FrameServer(cfg)
+    server.start()
+
+    physics_dt = 1.0 / float(cfg["sim"]["physics_hz"])
+    render_period = 1.0 / float(cfg["sim"]["render_hz"])
+    info_period = 1.0
+    settle_tol = float(cfg["place"]["settle_tol_rad"])
+    settle_hold = float(cfg["place"]["settle_hold_s"])
+    home_timeout = float(cfg["place"]["home_timeout_s"])
+
+    pending: dict | None = None
+    next_tick = time.monotonic()
+    next_render = 0.0
+    next_info = 0.0
+
+    try:
+        while app.is_running():
+            sc.step()
+            now = time.monotonic()
+
+            # ---- 收尾上一轮请求 ------------------------------------------
+            if pending is not None:
+                if pending["kind"] == "setup":
+                    done, ok = True, True
+                else:
+                    if sc.home_error() > settle_tol:
+                        pending["hold_since"] = None
+                        done, ok = False, False
+                    elif pending["hold_since"] is None:
+                        pending["hold_since"] = now
+                        done, ok = False, False
+                    else:
+                        done = now - pending["hold_since"] >= settle_hold
+                        ok = done
+                    if not done and now >= pending["deadline"]:
+                        done, ok = True, False
+
+                if done:
+                    stamp = time.time()
+                    cup_truth, cube_truth = sc.read_object_truth()
+                    server.send(protocol.frame_object(cup_truth, cube_truth, stamp))
+                    server.send(protocol.frame_done(pending["rid"], ok, stamp))
+                    pending = None
+
+            # ---- 执行新命令 ----------------------------------------------
+            while True:
+                try:
+                    kind, values = server.cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                if kind == protocol.CMD_JOINTS:
+                    if pending is None:
+                        sc.apply_joint_target(values)
+                elif kind == protocol.CMD_SETUP:
+                    sc.set_cup_pose(values[:3])
+                    pending = {"kind": "setup", "rid": int(values[3])}
+                elif kind == protocol.CMD_PLACE:
+                    sc.set_cube_pose(values[:3])
+                    sc.command_home()
+                    pending = {
+                        "kind": "place",
+                        "rid": int(values[3]),
+                        "deadline": now + home_timeout,
+                        "hold_since": None,
+                    }
+
+            # ---- 出帧 ----------------------------------------------------
+            server.send(protocol.frame_joints(sc.read_joint_state(), time.time()))
+
+            if now >= next_info:
+                send_camera_info(server, cfg)
+                next_info = now + info_period
+
+            if now >= next_render:
+                front, wrist = sc.render_all()
+                stamp = time.time()
+                server.send(protocol.frame_image(protocol.CAM_FRONT, front, stamp))
+                server.send(protocol.frame_image(protocol.CAM_WRIST, wrist, stamp))
+                next_render = now + render_period
+
+            # ---- 节流 ----------------------------------------------------
+            next_tick += physics_dt
+            delay = next_tick - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+            else:
+                next_tick = time.monotonic()
+    finally:
+        server.stop()
+
+
+def main() -> None:
+    """解析参数、起 Isaac App，再 import 场景模块交给 run() 跑主循环。
+
+    AppLauncher 必须先于 scene 的 import：isaacsim 的扩展只有在 app 起来
+    之后才能加载，提前导入会直接崩，所以 load_config / Scene 都放在
+    AppLauncher 之后。
+
+    默认 headless，只有显式加 --gui 才开窗口（调试相机画面时用）。
+    enable_cameras 必须为 True，否则相机传感器拿不到渲染 buffer，图像帧
+    全是空的。App 关掉之后才能退出，close() 里负责释放 PhysX 和渲染。
+    """
+    import argparse
+
+    from isaaclab.app import AppLauncher
+
+    parser = argparse.ArgumentParser(description="Isaac Sim 仿真侧（sim_app）")
+    parser.add_argument("--config", default=None, help="scene.yaml 路径，默认取同目录")
+    parser.add_argument("--gui", action="store_true", help="显示 Isaac 窗口")
+    AppLauncher.add_app_launcher_args(parser)
+    args = parser.parse_args()
+    args.headless = not args.gui
+    args.enable_cameras = True
+
+    launcher = AppLauncher(args)
+    try:
+        import scene as scene_mod
+
+        cfg = scene_mod.load_config(args.config)
+        run(cfg, launcher.app)
+    finally:
+        launcher.app.close()
+
+
+if __name__ == "__main__":
+    main()

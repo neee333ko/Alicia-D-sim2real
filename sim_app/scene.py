@@ -329,10 +329,12 @@ def create_cameras(cfg: dict):
     返回顺序就是 protocol 里 CAM_FRONT / CAM_WRIST 的下标，别调换。
 
     front 用世界坐标定死（eye 看 look_at），画面对齐台面，方便每轮对比；
-    wrist 挂在机械臂末端，位姿只能是相对父 prim 的安装偏移，所以必须用
-    convention="parent"，臂一动它跟着动。只取 rgb：深度和分割这里用不到，
-    多开一个 buffer 只会拖慢渲染。视场角由 focal_length + aperture 决定，
-    改分辨率不会改变画面范围。
+    wrist 挂在机械臂末端 prim 下，pos/rot 是相对父 prim 的安装偏移，臂一动
+    它跟着动。rot 按 opengl（USD 相机）约定书写：零偏时光轴是父节点的 -Z、
+    上方 +Y，要改成"沿 +Z 看出去"就换成 convention="ros" 再写偏航。
+
+    只取 rgb：深度和分割这里用不到，多开一个 buffer 只会拖慢渲染。视场角
+    由 focal_length + aperture 决定，改分辨率不会改变画面范围。
     """
     import omni.usd
     import isaaclab.sim as sim_utils
@@ -367,7 +369,8 @@ def create_cameras(cfg: dict):
     if not stage.GetPrimAtPath(tool_path).IsValid():
         raise ValueError(f"腕部相机的父 prim 不存在：{tool_path}")
 
-    # 固定轴 X-Y-Z：q = qz * qy * qx，展开成 (w, x, y, z)
+    # 固定轴 X-Y-Z：q = qz * qy * qx，展开成 (w, x, y, z)。
+    # RPY 直接作用在 USD 相机坐标上（opengl 约定），下面不再做坐标系换算
     roll, pitch, yaw = (math.radians(float(v)) for v in wrist["offset_rpy_deg"])
     cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
     cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
@@ -391,7 +394,7 @@ def create_cameras(cfg: dict):
             offset=CameraCfg.OffsetCfg(
                 pos=tuple(float(v) for v in wrist["offset_pos"]),
                 rot=wrist_rot,
-                convention="parent",
+                convention="opengl",
             ),
             width=int(wrist["width"]),
             height=int(wrist["height"]),
@@ -411,6 +414,10 @@ class Scene:
         reset 早了，后面 spawn 的模型进不了物理世界；资产建完却不 reset，
         刚体没有物理句柄，第一次 step 就会报错。
 
+        reset 必须排在读 joint_names 之前：资产是听 timeline 的 PLAY 事件
+        才初始化的（reset 会触发），在那之前 root_physx_view 还是 None，
+        读关节名直接 AttributeError。相机同理由 reset 初始化，所以也要先建。
+
         复位角来自 reset.json，文件不存在就按全零启动并打一行日志——缺一个
         姿态文件不该让仿真起不来，但也不能悄悄用错的姿态。写进仿真后还要把
         PD 目标设成同一个值，否则下一步隐式执行器会把关节拽回零位。
@@ -424,6 +431,7 @@ class Scene:
         self.cube = create_cube(cfg)
         self.cup = create_cup(cfg)
         self.cameras = create_cameras(cfg)
+        self.sim.reset()
 
         # USD 里的关节顺序和配置顺序不保证一致，下发和回读一律按 USD 顺序
         self.joint_order = list(self.robot.joint_names)
@@ -457,19 +465,30 @@ class Scene:
 
         self.home_q = [targets[n] for n in self.joint_order]
 
-        self.sim.reset()
         q = torch.tensor([self.home_q], dtype=torch.float32, device=self.sim.device)
         self.robot.write_joint_state_to_sim(q, torch.zeros_like(q))
         self.robot.set_joint_position_target(q)
 
     def step(self) -> None:
-        """推进一个物理步，并且不渲染。
+        """推一个物理步：先下发关节目标，步进，再刷新资产 buffer。
 
         物理固定 60Hz、出图只有 30Hz，渲染交给 render_all 单独触发。这里若用
         默认的 render=True，每一步都会跑一遍渲染管线，GPU 时间白花一倍，相机
         帧的时间戳也会和关节帧错开。
+
+        write_data_to_sim 必须在 step 之前：set_joint_position_target 只填
+        内部 buffer，真正把目标写进 PhysX 的是它，漏了机械臂就不会动。
+
+        update(dt) 必须在 step 之后：sim.step() 不会刷新资产数据，缺了它
+        read_joint_state / read_object_truth 读到的永远是初始值，home_error
+        也恒为 0，place 会立刻误判成功。
         """
+        dt = self.sim.get_physics_dt()
+        self.robot.write_data_to_sim()
         self.sim.step(render=False)
+        self.robot.update(dt)
+        self.cube.update(dt)
+        self.cup.update(dt)
 
     def apply_joint_target(self, q7) -> None:
         """把一条 /joint_commands 的 7 维目标落到物理关节上。
@@ -622,17 +641,25 @@ class Scene:
         return cup_truth, cube_truth
 
     def render_all(self) -> list:
-        """渲染一次，取出两路相机的 RGB，返回 [front, wrist]。
+        """渲染一次，取出两路相机的当前帧 RGB，返回 [front, wrist]。
 
         必须自己先触发 sim.render()：Scene.step() 关掉了自动渲染，相机 buffer
         只有在渲染管线跑过之后才是当前帧，直接读会拿到上一帧。
+
+        渲染完还要逐台 update(dt)：Camera.data 只在 _is_outdated 为真时才去
+        读 buffer，而 _is_outdated 正是 update() 置位的，漏了它第一帧之后
+        画面就永久冻结。dt 用物理步长，和 SensorBase 内部的时间戳基准一致。
 
         顺手拷成 numpy：相机 buffer 是复用的显存，下一帧就被覆盖，交给发送
         线程的数组必须已经离开 GPU。返回顺序和 cameras 一致，即
         CAM_FRONT / CAM_WRIST。
         """
         self.sim.render()
-        return [
-            cam.data.output["rgb"][0, ..., :3].detach().cpu().numpy().astype(np.uint8)
-            for cam in self.cameras
-        ]
+        dt = self.sim.get_physics_dt()
+
+        frames = []
+        for cam in self.cameras:
+            cam.update(dt)
+            rgb = cam.data.output["rgb"][0, ..., :3]
+            frames.append(rgb.detach().cpu().numpy().astype(np.uint8))
+        return frames
