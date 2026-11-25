@@ -1,7 +1,8 @@
 # wrist 相机内参。camera_info_manager 的标准格式。
 #
 # ！！！当前是未标定的占位值 ！！！
-# fx/fy 按水平视场角 60° 估算：fx = 640 / (2·tan(30°)) ≈ 554，cx/cy 取图像中心。
+# wrist 是 4:3 规格的镜头（80°H × 65°V）。输出切到 1280×720 相当于上下裁切，
+# 水平 FOV 仍是 80°：fx = 640 / tan(40°) ≈ 761，fy 同取 761，cx/cy 取图像中心。
 # 畸变系数全 0，等于假设没有畸变。节点能正常起来、rviz 也能画，但精度不能信。
 #
 # 标定方法（标定完直接覆盖这个文件，不用改代码）：
@@ -10,14 +11,14 @@
 #   → 在窗口里把棋盘格移遍画面各区域，CALIBRATE → SAVE
 #   → 生成的 ost.yaml 里取值填到下面，或者直接把 camera_info_url 指向那份文件
 
-image_width: 640
-image_height: 480
+image_width: 1280
+image_height: 720
 camera_name: wrist
 camera_matrix:
   rows: 3
   cols: 3
-  data: [554.0, 0.0, 320.0,
-         0.0, 554.0, 240.0,
+  data: [761.0, 0.0, 640.0,
+         0.0, 761.0, 360.0,
          0.0, 0.0, 1.0]
 distortion_model: plumb_bob
 distortion_coefficients:
@@ -33,6 +34,6 @@ rectification_matrix:
 projection_matrix:
   rows: 3
   cols: 4
-  data: [554.0, 0.0, 320.0, 0.0,
-         0.0, 554.0, 240.0, 0.0,
+  data: [761.0, 0.0, 640.0, 0.0,
+         0.0, 761.0, 360.0, 0.0,
          0.0, 0.0, 1.0, 0.0]

@@ -249,7 +249,7 @@ class PolicyNode(Node):
         for shape in feats.values():
             if len(shape) == 3:
                 return int(shape[1]), int(shape[2])
-        return 480, 640
+        return 720, 1280
 
     # ------------------------------------------------------------------ 回调
     def _stamp_of(self, msg) -> float:

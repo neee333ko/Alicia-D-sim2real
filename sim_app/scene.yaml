@@ -70,47 +70,48 @@ table:
   color: [0.70, 0.68, 0.63]    # 线性值，取自实拍照片 #D9D6D1
 
 # ---------- 方块 ----------
+# 尺寸/质量/摩擦/颜色由 task.yaml 的 object.cube 提供，这里只给 prim 路径
 cube:
   prim: /World/Cube
-  edge: 0.025             # 实机方块边长 2.5 cm
-  mass: 0.020
-  friction: 0.8
-  color: [0.02, 0.02, 0.02]
 
 # ---------- 杯子 ----------
 # 锥台形杯子（上宽下窄）：用一圈薄板沿锥面倾斜拼出，方块能真的掉进去。
 cup:
   prim: /World/Cup
-  height: 0.080           # 实机杯高 8 cm
-  top_diameter: 0.060     # 杯口直径 6 cm
-  bottom_diameter: 0.040  # 杯底直径 4 cm
-  wall_thickness: 0.002
-  wall_segments: 32       # 段数越多越圆；32 段在 640x480 里已经看不出棱
+  # 尺寸/壁厚/颜色由 task.yaml 的 object.cup 提供，这里只留纯几何细节
+  wall_segments: 32       # 段数越多越圆；32 段在 1280x720 里已经看不出棱
   bottom_thickness: 0.004
-  color: [0.85, 0.02, 0.30]
 
 # ---------- 相机 ----------
-# 分辨率 640x480、30fps 与 task.yaml 的真机配置一致。
+# 分辨率 1280x720、30fps 与 task.yaml 的真机配置一致。
 # 内参由 focal_length + horizontal_aperture 算出，导出给 bridge 的 K 就是它。
 camera:
   front:
-    width: 640
-    height: 480
-    eye: [0.10, -0.30, 0.55]      # 世界坐标，桌面支架位置
-    look_at: [0.47, 0.07, 0.05]   # 看向杯子和方块的中间
-    # f=21.4mm / 36mm 画幅 -> fx = 640*21.4/36 ≈ 380，
-    # 对应厂商镜头的 80°(H) × 65°(V) 视场
-    focal_length: 21.4
+    width: 1280
+    height: 720
+    # 位姿直接对应 Isaac 面板里 Cam_Front 的 Transform（opengl 语义）：
+    # Translate (0.07, -0.21, 0.27)，Orient XYZ (0, -40, -90) 度。
+    pos: [0.07, -0.21, 0.27]
+    rpy_deg: [0.0, -40.0, -90.0]
+    # front 彩色模组原生 1920x1080、FOV 86.2°(H) x 55.2°(V)。输出 1280x720
+    # 与原生同为 16:9，整幅缩放不改视场。严格算 fx≈683、fy≈688，
+    # 仿真只能给一个焦距，取中 686（水平 86.0°、垂直 55.4°，各差 0.2°），
+    # 对应 36mm 画幅下 f=686*36/1280≈19.3mm。
+    focal_length: 19.3
     horizontal_aperture: 36.0
   wrist:
-    width: 640
-    height: 480
+    width: 1280
+    height: 720
     parent: tool0                 # 挂在夹爪末端，跟着臂一起动
-    offset_pos: [0.0, 0.0, 0.05]  # parent 坐标系下的安装偏移
-    # OpenGL 约定下相机看 -Z，零偏时背对夹爪；绕 Y 翻 180° 让它朝 +Z
-    # （即夹爪伸出方向），同时保持画面「上方」仍是 parent 的 +Y。
-    offset_rpy_deg: [0.0, 180.0, 0.0]
-    # 与 front 同一套镜头规格（80°H × 65°V），fx 同样是 ≈ 380
+    # 实机安装位置：腕关节背侧、指尖后方，按 Isaac 面板里对齐真机画面的
+    # 实测值写死（tool0 局部坐标，单位 m）。
+    offset_pos: [-0.05692, 0.0, -0.07971]  # parent 坐标系下的安装偏移
+    # 实机安装姿态（固定轴 X-Y-Z 欧拉角，单位度）：roll=180 把光轴从 -Z
+    # 翻向指尖方向，yaw=-90 让画面水平轴对齐两指连线，pitch=-20 是略偏的
+    # 俯仰补偿。
+    offset_rpy_deg: [180.0, -20.0, -90.0]
+    # wrist 是 4:3 规格的镜头（80°H × 65°V）。切到 1280x720 相当于上下裁切，
+    # 水平 FOV 仍是 80°，所以 f 保持 21.4（1280 宽下 fx≈761）。
     focal_length: 21.4
     horizontal_aperture: 36.0
 

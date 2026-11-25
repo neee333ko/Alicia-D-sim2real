@@ -10,18 +10,20 @@ frame: world          # 原点=桌面台面左前角，x 指向机器人，y 向
 # ---------- 物体 ----------
 object:
   cube:
-    size: 0.030       # 边长，正方体
+    size: 0.025       # 边长，正方体（2.5 cm）
     mass: 0.020
     friction: 0.8
-    color: red        # 真机用红色，HSV 阈值分割
+    color: [0.02, 0.02, 0.02]   # 实机黑色；HSV 阈值在 calib/detector.yaml
     real_material: 硬塑料
-    # 30mm 方块 vs 70mm 杯内径 → 单边余量 20mm，不至于太难也不至于一看就会
+    # 25mm 方块 vs 56mm 杯内径 → 单边余量 15.5mm，不至于太难也不至于一看就会
   cup:
-    inner_diameter: 0.070
-    outer_diameter: 0.078
-    height: 0.090
+    top_diameter: 0.060      # 杯口外径（上宽下窄的锥台）
+    bottom_diameter: 0.040   # 杯底外径
+    inner_diameter: 0.056    # 口部内径 = 外径 - 2×壁厚，成功判据用它
+    height: 0.080
     mass: 0.050
-    wall: 0.004
+    wall: 0.002
+    color: [0.85, 0.02, 0.30]   # 实机杯身洋红；渲染与检测共用
     real_material: 硬塑料（不要纸杯，会被夹爪压变形）
     markers:
       rim: {dict: 4X4_50, id: 0, size: 0.020, mount: 杯口外壁}      # 解算杯口圆心
@@ -29,12 +31,15 @@ object:
 
 # ---------- 摆位 ----------
 spawn:
-  cube: {center: [0.42, 0.00, 0.015], yaw_deg: 0}   # z 是方块中心高度
-  cup:  {center: [0.52, 0.14, 0.045], fixed: true}
+  cube: {center: [0.31, -0.08, 0.0125], yaw_deg: 0}  # 随机区中心（z = edge/2）
+  cup:  {center: [0.30, -0.26, 0.040], fixed: true}
+  # 方块随机区：以 cube.center 为中心的正方形，四角
+  # (0.40,0) (0.22,0) (0.40,-0.16) (0.22,-0.16)，即 x∈[0.22,0.40]、y∈[-0.16,0.00]。
+  # stage* 里给的是半宽，stage2 正好铺满这个正方形。
   randomization:                # 训练数据先固定，成功率稳了再一级一级加
-    stage0: {cube_xy: 0.000, cube_yaw_deg: 0}
-    stage1: {cube_xy: 0.030, cube_yaw_deg: 0}
-    stage2: {cube_xy: 0.030, cube_yaw_deg: 30}
+    stage0: {cube_x: 0.000, cube_y: 0.000, cube_yaw_deg: 0}
+    stage1: {cube_x: 0.045, cube_y: 0.040, cube_yaw_deg: 0}
+    stage2: {cube_x: 0.090, cube_y: 0.080, cube_yaw_deg: 30}
 
 # ---------- 脚本专家批量生成（仿真） ----------
 expert:
@@ -54,20 +59,20 @@ robot:
 
 # ---------- 相机 ----------
 camera:
-  front: {name: cam_front, resolution: [640, 480], fps: 30, mount: 桌面支架, fixed: true}
-  wrist: {name: cam_wrist, resolution: [640, 480], fps: 30, mount: 夹爪上方, fixed: true}
+  front: {name: cam_front, resolution: [1280, 720], fps: 30, mount: 桌面支架, fixed: true}
+  wrist: {name: cam_wrist, resolution: [1280, 720], fps: 30, mount: 夹爪上方, fixed: true}
   rule: 整个数据集期间不许移动、不许改焦距
 
 # ---------- 成功判据 ----------
 success:
   sim:                        # 仿真里有真值，直接读位姿
     - cube.pose.z < cup.height - 0.010        # 方块中心低于杯口
-    - cube.pose.xy 在杯口内径圆内 (r < 0.035)
+    - cube.pose.xy 在杯口内径圆内 (r < 0.028)
     - gripper > 0.8                            # 已松开
     - 以上保持 hold_s
   real:                       # 真机只能看画面
     - 检测到 rim marker (id 0) → 杯口圆心 + 半径
-    - 方块红色质心落在杯口圆内 (r < 0.035)
+    - 方块黑色质心落在杯口圆内 (r < 0.028)
     - bottom marker (id 1) 被遮挡或丢失      # 关键：区分"放进去了"和"悬在口上"
     - gripper 指令已回 1.0
     - 方块质心 0.5s 内位移 < 2mm              # 停稳
@@ -88,7 +93,7 @@ data:
   root: /home/tongou.wei/workspace/src/pi/datasets/cube_into_cup
   demos_dir: demos_v1
   demo_count: 30
-  language: "把方块放进杯子里"   # 给 VLA 用；ACT 忽略
+  language: "把黑色方块放进杯子里"   # 给 VLA 用；ACT 忽略
 
 # ---------- 训练 ----------
 train:

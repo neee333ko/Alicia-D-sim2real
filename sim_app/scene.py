@@ -20,23 +20,47 @@ import yaml
 # 仓库根：sim_app/ 的上一层。yaml 里的相对路径都以它为基准
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene.yaml")
+# 任务定义在仓库根，真机采集/训练/评测也读它。物体的尺寸/质量/颜色以它为准
+TASK_CONFIG = os.path.join(ROOT, "task.yaml")
 
 
 def load_config(path: str | None = None) -> dict:
-    """读 scene.yaml，并把相对路径按仓库根解析成绝对路径。
+    """读 scene.yaml + task.yaml，合并成一份 sim_app 用的配置。
 
-    配置里的 assets/、poses/ 都是相对仓库根写的，换机器不用改；这里统一
-    转绝对路径，sim_app 从任何 cwd 启动都能找到文件。只处理已知的路径字段，
-    不做通用扫描——配置里出现新路径字段时要显式加进来。
+    分工：scene.yaml 管环境（光、桌、机械臂、相机、socket、物理步长）和
+    纯仿真实现细节（杯壁段数、底厚等）；task.yaml 管物体与任务（方块/杯子的
+    尺寸、质量、颜色、摆位、成功判据）。这几项同时被真机检测、训练和仿真读，
+    只留 task.yaml 一处，避免两边各写一份慢慢漂移。
+
+    两份配置的字段名不完全一样（size/edge、wall/wall_thickness），这里显式
+    映射，下游 create_cube/create_cup 不用跟着改。路径字段按仓库根转绝对路径。
     """
     cfg_path = path or DEFAULT_CONFIG
     with open(cfg_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+    with open(TASK_CONFIG, encoding="utf-8") as f:
+        obj = yaml.safe_load(f)["object"]
 
+    # 配置里的 assets/、poses/ 都是相对仓库根写的，换机器不用改
     for key in ("usd", "home_pose_file"):
         value = cfg["robot"][key]
         if value and not os.path.isabs(value):
             cfg["robot"][key] = os.path.normpath(os.path.join(ROOT, value))
+
+    cube, cup = obj["cube"], obj["cup"]
+    cfg["cube"].update(
+        edge=float(cube["size"]),
+        mass=float(cube["mass"]),
+        friction=float(cube["friction"]),
+        color=list(cube["color"]),
+    )
+    cfg["cup"].update(
+        top_diameter=float(cup["top_diameter"]),
+        bottom_diameter=float(cup["bottom_diameter"]),
+        height=float(cup["height"]),
+        wall_thickness=float(cup["wall"]),
+        color=list(cup["color"]),
+    )
     return cfg
 
 
@@ -321,7 +345,7 @@ def create_cup(cfg: dict):
 
     # 占位位置：先摆在台面空处，免得启动时和机械臂基座重叠、被 kinematic
     # 体顶开。第一次 setup 会用真实位置覆盖，别把它当成本轮位置读。
-    set_prim_pose(root, (0.30, -0.15, height / 2.0))
+    set_prim_pose(root, (0.30, -0.26, height / 2.0))
 
     # 锥面斜率：半径从 r_bot 线性增到 r_top，倾角就是高度方向的反正切
     slope = math.atan2(r_top - r_bot, height)
@@ -440,10 +464,10 @@ def create_cameras(cfg: dict):
 
     返回顺序就是 protocol 里 CAM_FRONT / CAM_WRIST 的下标，别调换。
 
-    front 用世界坐标定死（eye 看 look_at），画面对齐台面，方便每轮对比；
+    front 位姿按 Isaac 面板里的 pos + XYZ 欧拉写死，画面每轮可比；
     wrist 挂在机械臂末端 prim 下，pos/rot 是相对父 prim 的安装偏移，臂一动
-    它跟着动。rot 按 opengl（USD 相机）约定书写：零偏时光轴是父节点的 -Z、
-    上方 +Y，要改成"沿 +Z 看出去"就换成 convention="ros" 再写偏航。
+    它跟着动。两者都用 opengl（USD 相机）约定，欧拉按内旋 X-Y-Z 合成，
+    yaml 里的数字与面板 Transform 完全一致，在面板里调好直接抄即可。
 
     只取 rgb：深度和分割这里用不到，多开一个 buffer 只会拖慢渲染。视场角
     由 focal_length + aperture 决定，改分辨率不会改变画面范围。
@@ -455,6 +479,19 @@ def create_cameras(cfg: dict):
     cams = cfg["camera"]
 
     front = cams["front"]
+    # 位姿按内旋 X-Y-Z 合成（R = Rx·Ry·Rz），与 Isaac 面板显示的欧拉一致；
+    # convention 用 opengl，数字就是面板上的数字，不再经过 world 约定的换算。
+    f_roll, f_pitch, f_yaw = (math.radians(float(v)) for v in front["rpy_deg"])
+    fcr, fsr = math.cos(f_roll / 2.0), math.sin(f_roll / 2.0)
+    fcp, fsp = math.cos(f_pitch / 2.0), math.sin(f_pitch / 2.0)
+    fcy, fsy = math.cos(f_yaw / 2.0), math.sin(f_yaw / 2.0)
+    front_rot = (
+        fcr * fcp * fcy - fsr * fsp * fsy,
+        fsr * fcp * fcy + fcr * fsp * fsy,
+        fcr * fsp * fcy - fsr * fcp * fsy,
+        fcr * fcp * fsy + fsr * fsp * fcy,
+    )
+
     front_cam = Camera(
         CameraCfg(
             prim_path="/World/Cam_Front",
@@ -465,9 +502,9 @@ def create_cameras(cfg: dict):
                 clipping_range=(0.01, 100.0),
             ),
             offset=CameraCfg.OffsetCfg(
-                pos=tuple(float(v) for v in front["eye"]),
-                rot=look_at_quat(front["eye"], front["look_at"]),
-                convention="world",
+                pos=tuple(float(v) for v in front["pos"]),
+                rot=front_rot,
+                convention="opengl",
             ),
             width=int(front["width"]),
             height=int(front["height"]),
@@ -481,17 +518,16 @@ def create_cameras(cfg: dict):
     if not stage.GetPrimAtPath(tool_path).IsValid():
         raise ValueError(f"腕部相机的父 prim 不存在：{tool_path}")
 
-    # 固定轴 X-Y-Z：q = qz * qy * qx，展开成 (w, x, y, z)。
-    # RPY 直接作用在 USD 相机坐标上（opengl 约定），下面不再做坐标系换算
+    # 与 front 同一套：内旋 X-Y-Z（R = Rx·Ry·Rz），yaml 写的欧拉与面板数值一致。
     roll, pitch, yaw = (math.radians(float(v)) for v in wrist["offset_rpy_deg"])
     cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
     cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
     cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
     wrist_rot = (
-        cr * cp * cy + sr * sp * sy,
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy - sr * sp * sy,
+        sr * cp * cy + cr * sp * sy,
+        cr * sp * cy - sr * cp * sy,
+        cr * cp * sy + sr * sp * cy,
     )
 
     wrist_cam = Camera(

@@ -12,9 +12,9 @@
 cam_front:
   ros__parameters:
     video_device: /dev/cam_front
-    # MJPG 才能在 640x480 下跑满 30fps；YUYV 受 USB 带宽限制通常只有 15~20fps
+    # MJPG 才能在 1280x720 下跑满 30fps；YUYV 受 USB 带宽限制，720p 撑不住
     pixel_format: MJPG
-    image_size: [640, 480]
+    image_size: [1280, 720]
     time_per_frame: [1, 30]
     # 必须转成 rgb8：默认输出是 yuv422_yuy2，policy_node 不认这个编码
     output_encoding: rgb8
@@ -26,7 +26,7 @@ cam_wrist:
   ros__parameters:
     video_device: /dev/cam_wrist
     pixel_format: MJPG
-    image_size: [640, 480]
+    image_size: [1280, 720]
     time_per_frame: [1, 30]
     output_encoding: rgb8
     camera_frame_id: cam_wrist_optical
