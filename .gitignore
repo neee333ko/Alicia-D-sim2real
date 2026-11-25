@@ -39,3 +39,4 @@ udev
 
 # ---- 其他 ----
 assets/*
+${data}

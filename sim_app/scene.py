@@ -89,7 +89,7 @@ def create_environment(cfg: dict) -> None:
     """建静态环境和光源：地面、穹顶光、桌面。
 
     桌面顶面必须正好在 z=0——task.yaml 的 frame 就定义在台面上，方块中心
-    z=0.015、杯子中心 z=0.045 全部以此为基准，桌子摆错整条坐标链都错。
+    z=edge/2、杯子中心 z=height/2 全部以此为基准，桌子摆错整条坐标链都错。
     桌子只给碰撞体不给刚体，PhysX 会当成静态碰撞面，不会被机械臂推走。
     """
     import isaaclab.sim as sim_utils
@@ -97,18 +97,28 @@ def create_environment(cfg: dict) -> None:
     light = sim_utils.DomeLightCfg(intensity=600.0, color=(1.0, 1.0, 1.0))
     light.func("/World/DomeLight", light)
 
-    # 深色地面：桌外区域别是纯白，相机里才好分辨边界
+    # 深色地面：桌外区域别是纯白，相机里才好分辨边界。
+    # 必须压在台面以下（台面顶是 z=0）：和台面共面时，零位手臂一伸出桌沿
+    # 就顶在地面上，接触力会把腕关节顶离零位，看起来像 PD 打不直。
     ground = sim_utils.GroundPlaneCfg(color=(0.15, 0.15, 0.18))
     ground.func("/World/Ground", ground)
+    set_prim_pose("/World/Ground", (0.0, 0.0, -0.75))
 
     table = cfg["table"]
     table_cfg = sim_utils.CuboidCfg(
         size=tuple(float(v) for v in table["size"]),
         collision_props=sim_utils.CollisionPropertiesCfg(),
-        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.32, 0.32, 0.35)),
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=tuple(float(v) for v in table["color"])
+        ),
     )
     table_cfg.func(table["prim"], table_cfg)
-    set_prim_pose(table["prim"], table["pos"])
+
+    # 只转绕 z 的 yaw：桌子是长方体，绕 z 转 90° 就能让长边沿 y。
+    # 静态碰撞体必须先摆好位姿再进物理，之后不会再被改。
+    yaw = math.radians(float(table.get("yaw_deg", 0.0)))
+    yaw_quat = (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
+    set_prim_pose(table["prim"], table["pos"], yaw_quat)
 
 
 def create_robot(cfg: dict):
@@ -129,9 +139,92 @@ def create_robot(cfg: dict):
     yaw = math.radians(float(robot["base_yaw_deg"]))
     base_quat = (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
 
+    # 先按根 prim 路径把 USD 摆进 stage，再单独建立到 articulation root 上。
+    # 两者不是同一个 prim：导入器把 ArticulationRootAPI 打在根固定关节
+    # root_joint 上，若把 Articulation 也指向 /World/Robot，PhysX 找不到
+    # articulation（spawn 也会因为同一路径被引两次而冲突），所以拆开写。
+    spawn_cfg = sim_utils.UsdFileCfg(usd_path=robot["usd"])
+    spawn_cfg.func(robot["prim"], spawn_cfg)
+
+    # 基座位姿只能写到 prim 上：下面是 spawn=None，Isaac Lab 不会应用
+    # init_state 里的 pos/rot，写在那里等于没写（yaw 改了也不会转）。
+    # 旋转作用在 /World/Robot 这层父级，articulation root 跟着一起转。
+    set_prim_pose(robot["prim"], robot["base_pos"], base_quat)
+
+    import omni.usd
+    from pxr import Usd, UsdGeom, UsdPhysics, UsdShade
+
+    stage = omni.usd.get_context().get_stage()
+
+    # 实机臂壳是黑色，而 USD 里的材质是浅灰白。只在 /World/Robot 上绑材质
+    # 没用：模型是实例化引用，渲染用的是实例内部的绑定，外层的绑定对实例
+    # 代理不生效（实测臂仍是白的）。所以先把实例化关掉，让子 prim 变成可写
+    # 的真实 prim，再逐个 Gprim 直接绑深色材质，保证覆盖内部原有绑定。
+    root_prim = stage.GetPrimAtPath(robot["prim"])
+    n_deinst = 0
+    for _ in range(3):
+        changed = False
+        for prim in Usd.PrimRange(root_prim):
+            if prim.IsInstanceable():
+                prim.SetInstanceable(False)
+                n_deinst += 1
+                changed = True
+        if not changed:
+            break
+
+    look_path = "/World/RobotLook"
+    look_cfg = sim_utils.PreviewSurfaceCfg(
+        diffuse_color=(0.017, 0.017, 0.020),
+        roughness=0.65,
+        metallic=0.15,
+    )
+    look_cfg.func(look_path, look_cfg)
+    look_mat = UsdShade.Material(stage.GetPrimAtPath(look_path))
+
+    n_gprim = 0
+    n_proxy = 0
+    strengths = set()
+    for prim in Usd.PrimRange(root_prim):
+        api = UsdShade.MaterialBindingAPI(prim)
+        direct = api.GetDirectBinding()
+        has_binding = bool(direct.GetMaterialPath())
+        if not (prim.IsA(UsdGeom.Gprim) or has_binding):
+            continue
+        if prim.IsInstanceProxy():
+            n_proxy += 1
+        # 资产里可能用 strongerThanDescendants 把材质钉在某个 link 上，
+        # 那种绑定会压过子 mesh 的普通绑定。这里在同一个 prim 上按**相同
+        # 强度**重绑，才能覆盖它。强度存在绑定关系的 bindMaterialAs 元数据里。
+        rel = api.GetDirectBindingRel()
+        strength = (
+            rel.GetMetadata("bindMaterialAs") if rel and rel.IsValid() else None
+        ) or UsdShade.Tokens.weakerThanDescendants
+        strengths.add(str(strength))
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(look_mat, strength)
+        n_gprim += 1
+    print(
+        f"[sim_app] robot look: {n_gprim} prims (proxy={n_proxy}, deinst={n_deinst})"
+        f" mat_valid={stage.GetPrimAtPath(look_path).IsValid()} strengths={sorted(strengths)}",
+        flush=True,
+    )
+
+    # 把关节 drive 从 acceleration 改成 force：导入器给的类型下 stiffness 的
+    # 单位是「角加速度/rad」，实际力矩被关节惯量缩水（实测 625 只等效 44
+    # N·m/rad 左右），60Hz 下想靠调大数值补偿会直接发散。改成 force 后
+    # stiffness 就是 N·m/rad，配置里的 600 才有字面意义。
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(robot["prim"])):
+        for axis in ("angular", "linear"):
+            if prim.HasAPI(UsdPhysics.DriveAPI, axis):
+                d = UsdPhysics.DriveAPI(prim, axis)
+                d.GetTypeAttr().Set("force")
+                print(
+                    f"[drive] {prim.GetPath()} {axis} type={d.GetTypeAttr().Get()}",
+                    flush=True,
+                )
+
     robot_cfg = ArticulationCfg(
-        prim_path=robot["prim"],
-        spawn=sim_utils.UsdFileCfg(usd_path=robot["usd"]),
+        prim_path=robot["articulation_prim"],
+        spawn=None,
         init_state=ArticulationCfg.InitialStateCfg(
             pos=tuple(float(v) for v in robot["base_pos"]),
             rot=base_quat,
@@ -191,11 +284,12 @@ def create_cube(cfg: dict):
 
 
 def create_cup(cfg: dict):
-    """用一圈薄板拼出空心杯子，整杯是一个 kinematic 刚体，返回它的句柄。
+    """用一圈倾斜薄板拼出锥台形空心杯，整杯一个 kinematic 刚体，返回句柄。
 
-    单个实心圆柱会让方块卡在杯口掉不进去，所以墙体用 wall_segments 段长方体
-    沿圆周排开，段长取外接多边形的边长 2r·tan(π/N)，相邻两段在拐角处轻微
-    重叠，内壁看上去是闭合的。
+    实机杯子是上宽下窄的锥台（口 6 cm、底 4 cm、高 8 cm），等径圆柱会让
+    方块贴着内壁时位置和真机对不上。墙体仍用 wall_segments 段长方体，但
+    每段除了绕 z 摆在圆周上，还要绕自身切向轴倾斜一个锥角
+    atan((r_top - r_bot) / height)，让整圈薄板贴合成锥面。
 
     杯子不该被方块推走或被机械臂撞退，但每轮 setup 都要把它摆到新位置。
     纯静态碰撞体在 PhysX 里没有「重设位姿」的接口，只写 USD xform 在 Fabric
@@ -213,8 +307,9 @@ def create_cup(cfg: dict):
     cup = cfg["cup"]
     root = cup["prim"]
     height = float(cup["height"])
-    r_in = float(cup["inner_radius"])
-    r_out = float(cup["outer_radius"])
+    r_top = 0.5 * float(cup["top_diameter"])
+    r_bot = 0.5 * float(cup["bottom_diameter"])
+    wall_t = float(cup["wall_thickness"])
     segments = int(cup["wall_segments"])
     bottom_t = float(cup["bottom_thickness"])
     color = tuple(float(v) for v in cup["color"])
@@ -226,13 +321,19 @@ def create_cup(cfg: dict):
 
     # 占位位置：先摆在台面空处，免得启动时和机械臂基座重叠、被 kinematic
     # 体顶开。第一次 setup 会用真实位置覆盖，别把它当成本轮位置读。
-    set_prim_pose(root, (0.55, -0.15, height / 2.0))
+    set_prim_pose(root, (0.30, -0.15, height / 2.0))
 
-    # 墙体：盒子局部 y 轴指向径向外侧、x 轴沿切向，中心落在中径上
-    r_mid = 0.5 * (r_in + r_out)
-    chord = 2.0 * r_mid * math.tan(math.pi / segments)
+    # 锥面斜率：半径从 r_bot 线性增到 r_top，倾角就是高度方向的反正切
+    slope = math.atan2(r_top - r_bot, height)
+    # 壁板长度按斜面算，保证它在竖直方向的投影正好是 height
+    slant_h = height / math.cos(slope)
+    # 中高处的外表面半径与壁板中心半径
+    r_mid = 0.5 * (r_top + r_bot)
+    r_center = r_mid - 0.5 * wall_t
+    chord = 2.0 * r_center * math.tan(math.pi / segments)
+
     wall_cfg = sim_utils.CuboidCfg(
-        size=(chord, r_out - r_in, height),
+        size=(chord, wall_t, slant_h),
         collision_props=sim_utils.CollisionPropertiesCfg(),
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
     )
@@ -242,28 +343,39 @@ def create_cup(cfg: dict):
         path = f"{root}/Wall_{i:02d}"
         wall_cfg.func(path, wall_cfg)
 
-        # 绕 z 转 angle-90°，正好把局部 +y 转到径向外侧
-        yaw = angle - math.pi / 2.0
+        # 两次旋转复合：先绕自身 x（切向）倾一个 -slope 让顶端往外张，
+        # 再绕 z 转到圆周位置（angle-90° 把局部 +y 转到径向外侧）。
+        # 复合用四元数乘法 q = q_yaw ⊗ q_tilt，其中 q_tilt 只有 x 分量。
+        half_yaw = angle / 2.0 - math.pi / 4.0
+        half_tilt = -0.5 * slope
+        wy, zy = math.cos(half_yaw), math.sin(half_yaw)
+        wx, xx = math.cos(half_tilt), math.sin(half_tilt)
+        quat = (wy * wx, wy * xx, zy * xx, zy * wx)
+
+        # spawn 出来的 prim 已经自带 translate/orient/scale 三个 op，
+        # 只能改已有 op 的值，再 Add 会直接抛 Tf.ErrorException。
         xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-        xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(
-            Gf.Vec3d(r_mid * math.cos(angle), r_mid * math.sin(angle), 0.0)
+        ops = {op.GetOpName(): op for op in xf.GetOrderedXformOps()}
+        ops["xformOp:translate"].Set(
+            Gf.Vec3d(r_center * math.cos(angle), r_center * math.sin(angle), 0.0)
         )
-        xf.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
-            Gf.Quatd(math.cos(yaw / 2.0), Gf.Vec3d(0.0, 0.0, math.sin(yaw / 2.0)))
+        ops["xformOp:orient"].Set(
+            Gf.Quatd(quat[0], Gf.Vec3d(quat[1], quat[2], quat[3]))
         )
 
-    # 杯底：半径取内径，正好托住方块，不插进墙体
+    # 杯底：半径取底部内径，托住方块又不插进墙里
     bottom_cfg = sim_utils.CylinderCfg(
-        radius=r_in,
+        radius=r_bot - wall_t,
         height=bottom_t,
         collision_props=sim_utils.CollisionPropertiesCfg(),
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
     )
     bottom_path = f"{root}/Bottom"
     bottom_cfg.func(bottom_path, bottom_cfg)
-    UsdGeom.Xformable(stage.GetPrimAtPath(bottom_path)).AddTranslateOp(
-        UsdGeom.XformOp.PrecisionDouble
-    ).Set(Gf.Vec3d(0.0, 0.0, -height / 2.0 + bottom_t / 2.0))
+    # 同样只能改 spawn 时建好的 translate op，不能再 AddTranslateOp
+    xf = UsdGeom.Xformable(stage.GetPrimAtPath(bottom_path))
+    ops = {op.GetOpName(): op for op in xf.GetOrderedXformOps()}
+    ops["xformOp:translate"].Set(Gf.Vec3d(0.0, 0.0, -height / 2.0 + bottom_t / 2.0))
 
     # spawn=None：prim 已经在上面建好了，这里只要一个能写物理位姿的句柄
     return RigidObject(RigidObjectCfg(prim_path=root, spawn=None))

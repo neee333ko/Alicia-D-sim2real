@@ -354,6 +354,7 @@ def run(cfg: dict, app) -> None:
     next_tick = time.monotonic()
     next_render = 0.0
     next_info = 0.0
+    next_log = 0.0
 
     try:
         while app.is_running():
@@ -421,6 +422,16 @@ def run(cfg: dict, app) -> None:
                 server.send(protocol.frame_image(protocol.CAM_WRIST, wrist, stamp))
                 next_render = now + render_period
 
+            # ---- 1Hz 状态打印（调试用，看关节有没有被重力拖走） ------------
+            if now >= next_log:
+                q = sc.read_joint_state()
+                q_txt = " ".join(f"{float(v):+.3f}" for v in q)
+                print(
+                    f"[sim_app] q(rad)=[{q_txt}] home_err={sc.home_error():.4f}",
+                    flush=True,
+                )
+                next_log = now + 1.0
+
             # ---- 节流 ----------------------------------------------------
             next_tick += physics_dt
             delay = next_tick - time.monotonic()
@@ -439,20 +450,24 @@ def main() -> None:
     之后才能加载，提前导入会直接崩，所以 load_config / Scene 都放在
     AppLauncher 之后。
 
-    默认 headless，只有显式加 --gui 才开窗口（调试相机画面时用）。
-    enable_cameras 必须为 True，否则相机传感器拿不到渲染 buffer，图像帧
-    全是空的。App 关掉之后才能退出，close() 里负责释放 PhysX 和渲染。
+    headless / livestream 一律交给 AppLauncher 自己的参数：没有显示器或在
+    容器里跑就加 --headless；要远程看画面加 --livestream 2（局域网）或 1
+    （公网，需要 PUBLIC_IP），它会自动打开 headless 并保留视口渲染。这里
+    不能再覆写 headless，否则和 livestream 的"强制 headless"打架。
+
+    enable_cameras 由我们自己打开：两路 RGB 相机是协议的一部分，少了它
+    传感器不注册渲染管线，图像帧全是空的。App 关掉之后才能退出，close()
+    里负责释放 PhysX 和渲染。
     """
     import argparse
+    import traceback
 
     from isaaclab.app import AppLauncher
 
     parser = argparse.ArgumentParser(description="Isaac Sim 仿真侧（sim_app）")
     parser.add_argument("--config", default=None, help="scene.yaml 路径，默认取同目录")
-    parser.add_argument("--gui", action="store_true", help="显示 Isaac 窗口")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
-    args.headless = not args.gui
     args.enable_cameras = True
 
     launcher = AppLauncher(args)
@@ -461,6 +476,11 @@ def main() -> None:
 
         cfg = scene_mod.load_config(args.config)
         run(cfg, launcher.app)
+    except BaseException:
+        # app.close() 会直接关掉 kit 并结束进程，异常信息会被一起吞掉，
+        # 启动阶段出错时日志里只剩半截 kit 输出，所以先打 traceback 再关。
+        traceback.print_exc()
+        raise
     finally:
         launcher.app.close()
 
