@@ -57,6 +57,11 @@ class SimExpert(Node):
         self.declare_parameter("robot_version", "v5_6")
         self.declare_parameter("gripper_type", "50mm")
         self.declare_parameter("rate_hz", 30.0)
+        # 基座相对 world 的安装朝向。URDF 的零位 FK 是 tool0 在 x=-0.31，
+        # 即"向前"是基座系 -x；而 task.yaml 的物体坐标写在 world 下（+x）。
+        # 仿真里 scene.yaml 用 base_yaw_deg=180 把基座转过来，这里必须补上
+        # 同一个旋转，否则 IK 目标全落在机械臂背后，每一个 keyframe 都无解。
+        self.declare_parameter("base_yaw_deg", 180.0)
         # 抓取/放置时的抬升量（相对方块顶面 / 杯口）
         self.declare_parameter("approach_m", 0.10)
         self.declare_parameter("grasp_lift_m", 0.15)
@@ -102,6 +107,19 @@ class SimExpert(Node):
         self.model = RobotModel(str(urdf), end_link="tool0")
         self.fk = forward_kinematics
         self.ik = inverse_kinematics
+
+        # world → base 的逆变换（纯旋转，基座在原点）。IK 只认基座系，
+        # 所有 target 位姿进 IK 前都要先左乘它。
+        yaw = math.radians(float(p("base_yaw_deg").value))
+        c, s = math.cos(yaw), math.sin(yaw)
+        self.T_base_inv = np.array(
+            [
+                [c, s, 0.0, 0.0],
+                [-s, c, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
         self.rng = np.random.default_rng()
 
         # ---- 状态 ----------------------------------------------------------
@@ -252,7 +270,8 @@ class SimExpert(Node):
             # 只在夹爪开度变化的那一步补保持时间，纯位移不拖慢
             hold = self.grip_hold if prev_grip is not None and grip != prev_grip else 0.0
             if T is not None:
-                q = self._solve_ik(T, self.joints)
+                # 第一段跳过跳解检查：从零位到抓取点必然大角度移动
+                q = self._solve_ik(T, self.joints, check_jump=(i > 0))
                 if q is None:
                     return {"success": False, "reason": f"IK 无解：{label}"}
                 ok = self._move_to(q, grip, hold)
@@ -277,14 +296,22 @@ class SimExpert(Node):
         self.cmd = list(self.joints) + [1.0]
         return {"success": True, "reason": "done"}
 
-    def _solve_ik(self, T_target, q0):
+    def _solve_ik(self, T_target, q0, check_jump: bool = True):
+        # 目标位姿是 world 下的，IK 只认基座系。两者差一个 base_yaw 旋转，
+        # 不转的话 +x 的目标会落到机械臂背后，全部无解。
+        T_local = self.T_base_inv @ T_target
         # 固定种子：multi_start 的扰动可复现，同一个位姿不会这次左支下次右支
         res = self.ik(
-            self.model, T_target, q0, method="dls", multi_start=4, random_seed=0
+            self.model, T_local, q0, method="dls", multi_start=4, random_seed=0
         )
         if not res.get("success"):
             return None
         q = [float(v) for v in res["q"]]
+        # 第一段不能查跳解：从零位到抓取点本来就要转一大圈（实测 Joint5
+        # 差 1.3 rad），那不是换支，是"还没出发"。查了会把每一条示范都
+        # 卡死在第一步。只在段与段之间查，那里换支才会导致来回甩。
+        if not check_jump:
+            return q
         # multi_start 只在基础解失败时按残差挑解，可能挑到另一个 IK 分支；
         # 种子是当前实测角度，正常解离得很近，偏这么多说明换支了，插值会扫出大弧线
         jump = max(abs(a - b) for a, b in zip(q, q0))

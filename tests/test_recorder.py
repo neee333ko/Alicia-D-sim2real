@@ -218,8 +218,8 @@ def test_state_clock_backwards_resets_pair():
     a.push_state(10.020, [2.0] * 7)
     a.push_state(10.000, [0.0] * 7)
 
-    assert a.state_prev is None
-    assert a.state[1][0] == pytest.approx(0.0)
+    assert len(a.states) == 1
+    assert a.states[-1][1][0] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------- EpisodeStaging
@@ -337,8 +337,8 @@ def test_on_joint_state_reorders_by_name(node):
 
     node.on_joint_state(make_state_msg(10.0, values, names))
 
-    assert node.aligner.state is not None
-    assert list(node.aligner.state[1]) == pytest.approx(
+    assert len(node.aligner.states) == 1
+    assert list(node.aligner.states[-1][1]) == pytest.approx(
         [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.9]
     )
 
@@ -350,7 +350,7 @@ def test_on_joint_state_drops_message_missing_a_joint(node):
 
     node.on_joint_state(msg)
 
-    assert node.aligner.state is None
+    assert not node.aligner.states
     assert node.logger.messages("warn")
 
 
@@ -499,7 +499,7 @@ def test_push_state_stores_float32():
 
     a.push_state(1.0, [1, 2, 3, 4, 5, 6, 7])
 
-    assert a.state[1].dtype == np.float32
+    assert a.states[-1][1].dtype == np.float32
 
 
 # ---------------------------------------------------------------- 补充：回调门控
@@ -510,7 +510,7 @@ def test_callbacks_ignored_unless_recording(node):
     node.on_joint_state(make_state_msg(1.0, [0.0] * 7))
     node.on_image("front", make_image(IMG))
 
-    assert node.aligner.state is None
+    assert not node.aligner.states
     assert node.aligner.images == {}
 
 
@@ -551,8 +551,7 @@ def test_begin_creates_fresh_aligner(node):
 
     node.on_trial(String(data=json.dumps({"id": 1, "event": "begin"})))
 
-    assert node.aligner.state is None
-    assert node.aligner.state_prev is None
+    assert not node.aligner.states
 
 
 def test_publish_status_includes_frames_while_recording(node):

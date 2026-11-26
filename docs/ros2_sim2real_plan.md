@@ -3,7 +3,7 @@
 > 目标：从单任务实机 ACT，演进到「多任务 / 多物体 / 仿真预训练 / 真机闭环」的工程化系统。
 > 前置：实机链路已跑通（真机 + 相机 + SDK + LeRobot 数据集 + ACT 训练，在 2080 那台）；仿真环境已装好（Isaac Sim 5.1 + Isaac Lab 2.3.2，在 3090 那台）。
 > 总周期：一人全职约 4~5 个月（含 ROS 2 改造）。
-> 更新：2026-11-13
+> 更新：2026-11-26（recorder 落地、FastDDS profile、L2 端到端集成测试）
 
 ---
 
@@ -35,6 +35,9 @@
 | `/task/instruction` | 任务级指令话题 | **删除** | v1 只有一个任务，detector 不再读任务名 |
 | `/detector/condition` | 实时布尔话题 | **删除** | 和 `/orch/result` 表达同一件事，且全仓库无人订阅 |
 | 下游状态 | 编排方逐个探测 | **各节点发 `/{node}/status`（5Hz，latched）** | 发布者自己上报，见 5.8 |
+| 录制落盘 | 直接写 `LeRobotDataset` | **先 staging 再回灌** | `add_frame` 没有回滚，成功与否要等 `/orch/result`，见 5.7 |
+| 录制对齐 | 三路各缓存 5 帧、取最近邻，容差一帧 | **图像锚点 + state 0.3s 滚动缓冲，严格 `state[i] <= t_img <= state[i+1]`**；跨相机容差 50ms | 图像传输晚到几十~上百毫秒，只留两条 state 只能硬配，动作会滞后 |
+| 大图传输 | 默认 DDS 配置 | **`docker/fastdds/profile.xml`（SHM 64MB / UDP 8MB）+ `--ipc=host`** | 1280×720 单帧 2.7MB，默认 SHM 段装不下会回退 UDP 分片 |
 
 ---
 
@@ -79,7 +82,7 @@
 - `recorder_node` 独立订阅，驱动/相机异常不影响已录制数据
 - `success_detector` 自动判定，`orchestrator` 编排整轮评测，无需人工
 - `/joint_commands` 只有一个主动发布者：策略模式是 `action_executor`，专家模式是 `sim_expert`，两者不并存；`policy_node` 只产 chunk，不管时序
-- 判定只用视觉，真机仿真同一套；仿真真值只做离线对拍
+- 判定由 `judge` 选：仿真数据生成用 `ground_truth`，跨环境比较统一用 `vision`（见 4.4）
 
 ### 2.3 设计原则
 
@@ -124,6 +127,8 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 - 同网段：组播可用，什么都不用配，但要统一 `ROS_DOMAIN_ID` 和 `RMW_IMPLEMENTATION`
 - 不同网段：配 `ROS_DISCOVERY_SERVER`（Fast DDS）或 CycloneDDS 的静态 peers 列表
 - 第一阶段其实用不到跨机器：`driver + camera + recorder + policy` 全在 2080
+- **同机跨容器必须都加 `--ipc=host`**：各自 `/dev/shm` 互相不可见时，表现为发现正常（`topic info` 能看到 publisher）但一条消息也收不到
+- **1280×720 大图需要 Fast DDS profile**：单帧 2.7MB，默认 SHM 段装不下会回退 UDP 分片。`docker/fastdds/profile.xml` 把 SHM 段提到 64MB、UDP buffer 提到 8MB，容器内实测 `ros2 topic hz /camera/front/image_raw` ≈ 29.96Hz。该文件已 COPY 进 `alicia/base` 并用 `ENV FASTRTPS_DEFAULT_PROFILES_FILE` 指过去，上层镜像自动继承；旧镜像需重建，或在运行时用 `-v` + `-e` 覆盖
 
 ---
 
@@ -131,7 +136,7 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 
 这套接口是全局契约。真机模式和仿真模式必须逐字一致，否则后面每加一个节点都要改两套代码。
 
-**频率约定：全链路 30Hz。** 相机采图 30fps、`/joint_states` 30Hz、`/joint_commands` 30Hz、训练数据集 30fps、chunk 里每一步代表 1/30 秒。这五个数必须一致，改一个就要一起改——错位不会报错，只会让策略的整个时间轴偏掉（比如按 50Hz 采、按 30Hz 训，动作会慢 1.67 倍）。相机能不能跑 30Hz 要先实测（`v4l2-ctl --list-formats-ext`），USB 带宽不够时 YUYV 常常只有 30fps 而 MJPG 能到 60。
+**频率约定：全链路 30Hz。** 相机采图 30fps、`/joint_commands` 30Hz、训练数据集 30fps、chunk 里每一步代表 1/30 秒。这五个数必须一致，改一个就要一起改——错位不会报错，只会让策略的整个时间轴偏掉（比如按 50Hz 采、按 30Hz 训，动作会慢 1.67 倍）。`/joint_states` 是例外：仿真侧随物理步长发 60Hz，真机 `driver_node` 是 30Hz；`recorder` 按时间戳在缓冲里取「图像之后的第一条」当 action，两种频率都能配。
 
 ### 4.1 节点
 
@@ -144,10 +149,10 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 | `success_detector` | 2080 | `alicia/base:1.0` | ✅ 已实现 `vision` / `ground_truth` 两种判据与 `/detector/status`；合成图像验证过成功/超时路径 |
 | `sim_bridge` | 3090 | `alicia/base:1.0` | ✅ 已实现 `/sim/setup`、`/sim/place`、`ObjectPose` 发布、`/sim/status`；假 sim_app 验证过协议和断线重连。指令的服务端还要等 `sim_app` |
 | `sim_expert` | 3090 | `alicia/driver:1.0` | ✅ action server + `/expert/status`；轨迹由 `/object/pose` 真值生成，容器内 27 例通过 |
-| `recorder_node` | 2080 | — | ⬜ 未实现 |
-| `orchestrator`（旧称 `eval_orchestrator`） | 2080 / 3090 | `alicia/base:1.0` | ✅ 编排、服务、状态检查、abort 已实现并在容器内测通；下游已对接 sim / expert / detector 三路状态，recorder 未建（见 5.12） |
-| `sim_app` | 3090 | 宿主 conda `robot_sim`（py3.11） | ⬜ 未实现 |
-| `sim_scene` | 3090 | — | ⬜ 未实现 |
+| `recorder_node` | 2080 | `alicia/recorder:1.0` | ✅ 已实现：订阅 `/joint_states` + 两路图像，按 `/orch/trial` 开关窗，staging → 回灌 LeRobot 数据集；39 个单测 + L2 集成通过 |
+| `orchestrator`（旧称 `eval_orchestrator`） | 2080 / 3090 | `alicia/base:1.0` | ✅ 编排、服务、状态检查、abort 已实现并在容器内测通；sim / expert / recorder / detector 四路状态齐全 |
+| `sim_app` | 3090 | 宿主 conda `robot_sim`（py3.11） | ✅ 已实现：场景/相机/杯子/机械臂 + 10Hz 真值推送；L2 用 `tests/integration/fake_sim_app.py` 替身验证协议 |
+| `sim_scene` | 3090 | — | ✅ 已并入 `sim_app/scene.py`，不再单列进程 |
 | `robot_state_publisher` | 2080 | 现成 ROS 包 | ⬜ 未接入 |
 
 **仿真侧为什么要拆两个进程**：Isaac Sim 5.1 只跑在 Python 3.11，ROS 2 Humble 是 3.10，同进程 import 不了。所以 `sim_app`（无 ROS）+ `sim_bridge`（无 Isaac）两个进程，中间走本机 unix socket。协议写在 `ros2_ws/src/sim_bridge/sim_bridge.py` 文件头，`sim_app` 照着实现即可。
@@ -212,7 +217,8 @@ sudo apt install -y ros-humble-desktop python3-colcon-common-extensions python3-
 - **`/arm/home` 是"开始动"不是"已到位"**（只有 driver_node 提供；仿真侧复位并入 `/sim/place`）。调用方要自己轮询 `/joint_states` 等它到位。
 - **时间戳一律用 ROS 时钟**（`get_clock().now()`），不用 `time.time()`。chunk 的 stamp 来自相机/仿真的 `header.stamp`，`action_executor` 也用同一个源比较。混用会让 chunk 全被判过期，表现是"策略在推理但机械臂不动"。唯一例外是 `/{node}/status` 的 `stamp`：它用墙钟 `time.time()`，因为 orchestrator 也是用 `time.time()` 算年龄；跟 ROS 时钟混用会在仿真的 `/clock` 停住时把所有节点判成失联。
 - **所有消息必须填 `header.stamp`**（采集时刻，不是发布时刻）。
-- **观测对齐**：三路各缓存 5 帧，以最新图像为锚，关节状态取离锚点最近的一帧，相差 ≤ 一帧（33ms）即同一时刻；找不到就跳过，由 executor 在 150ms 后重发。
+- **policy_node 观测对齐**：三路各缓存 5 帧，以最新图像为锚，关节状态取离锚点最近的一帧，相差 ≤ 一帧（33ms）即同一时刻；找不到就跳过，由 executor 在 150ms 后重发。
+- **录制对齐（recorder）**：以图像 `stamp` 为采样时刻；`/joint_states` 滚动保留最近 0.3s，取满足 `state[i] <= t_img <= state[i+1]` 的相邻对，左邻当 `observation.state`、右邻当 `action`。两路图像相差 > 50ms 判为不同步、丢弃该拍；图像比最新 state 还新时先暂存，等 state 到齐再出帧。`action` 取下一时刻实际位置而不是 `/joint_commands`，真机拖动示教与仿真同分布。
 - **给 `uint8[]` 字段赋值必须用 `array.array("B", data)`，不能直接赋 `bytes`**。rclpy 会对 `bytes` 做逐元素校验，921KB 从 3000+ fps 掉到 6.6 fps，而且不报错。
 - **图像 QoS 用 best_effort**：丢一帧不影响策略，reliable 会在丢包时把相机节点堵住。
 - **`/orch/trial` 与各 `/{node}/status` 用 transient_local**，后启动的节点也能拿到最后一条。发布方必须用同样的 durability，否则 QoS 不兼容、根本匹配不上。
@@ -244,6 +250,12 @@ policy_node:
 
 success_detector:
   config_file: /calib/detector.yaml   # 所有视觉阈值都在那
+
+recorder:
+  fps: 30                     # 与 episode.fps 一致，写进数据集 meta
+  align_tol_s: 0.05           # 两路图像同步容差（≈1.5 个图像周期）
+  state_history_s: 0.3        # state 滚动缓冲；也是能容忍的图像延迟上限
+  result_timeout_s: 10.0      # end 之后等 /orch/result，超时按失败归档
 ```
 
 ### 4.6 QoS
@@ -445,30 +457,40 @@ ros2 service call /orch/abort std_srvs/srv/Trigger   # 立即中断
 
 ### 5.12 测试与当前缺口
 
-容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 71 个用例：
+容器内（真 ROS，独立 `ROS_DOMAIN_ID`）共 110 个用例：
 
 - 25 个 orchestrator 纯逻辑：状态检查、结果过滤、服务状态机（绕过 `__init__` 注入字段）
 - 19 个 orchestrator 集成：起真 `Orchestrator` + 假下游，覆盖服务成功/失败/超时、abort 真 cancel、begin/end 顺序、摆位失败、未就绪跳过、汇总输出
 - 27 个 `sim_expert`：IK 守卫与跳解拦截、插值与限速、到位/断流/取消、夹爪保持、keyframe 目标推算、action 收尾四条路径
+- 39 个 `recorder`：`FrameAligner`（配对/等右邻/缺图/不同步/去重/时钟倒退）、`EpisodeStaging`（jpg+npy、空集、同名目录清理）、消息解析、begin/end 状态机、result 去重、`_finalize` 分流
 
-`sim_bridge` 与 `success_detector` 没有自动化用例：前者靠假 sim_app 手工验证协议，后者靠合成图像验证判定路径。
+`sim_bridge` 与 `success_detector` 没有独立自动化用例：前者由 L2 端到端覆盖，后者靠合成图像验证判定路径。
+
+**L2 端到端集成测试** `tests/integration/test_pipeline.py`（默认 skip，`RUN_L2=1` 才跑）：
+
+```
+orchestrator ──/sim/place──→ sim_bridge ──unix socket──→ fake_sim_app（宿主）
+     │                            │
+     ├──/orch/trial──→ recorder   ├──/joint_states──→ sim_expert
+     │                            └──/camera/*──────→ sim_expert
+     └──/orch/result←── success_detector ←──/object/pose────┘
+```
+
+真进程、真 ROS、两个容器（driver + recorder，都要 `--ipc=host` 与 FastDDS profile）+ 宿主 `fake_sim_app.py` 替身（无需 Isaac）。4 个用例覆盖完整专家轨迹采集，1280×720 / 图像 30Hz / 关节 60Hz 下实测每集 ≈ 29Hz、`missing=1 stale=0`，数据集 parquet 可读。跑完后 recorder 用 `docker stop`（SIGTERM）而不是 `rm -f`，否则 `shutdown()` 里的 `finalize()` 不会执行、parquet 缺 footer。
 
 ```bash
-docker run --rm -e ROS_DOMAIN_ID=77 -v $PWD:/ws -w /ws alicia/driver:1.0 bash -lc \
-  "source /opt/ros/humble/setup.bash && \
-   colcon build --packages-select alicia_interfaces --build-base /tmp/b --install-base /tmp/i >/dev/null && \
-   source /tmp/i/setup.bash && python3 -m pytest tests -q"
+RUN_L2=1 python3 -m pytest --noconftest tests/integration/test_pipeline.py -s
 ```
 
 尚未对接的部分：
 
 | 项 | 现状 |
 |---|---|
-| `sim_app` | 未实现 `0x01` 场景同步 / `0x02` 摆放方块；必须先发新的 `type=4` 真值再发 `type=5` 确认。注意 `cup_pose.z` 必须是**杯口高度**，而 task.yaml 的 `spawn.cup.center` z 是杯体中心 |
-| `/{node}/status` | `sim`、`expert`、`detector` 已按 5.8 发布；`recorder` 未建，非 `dry_run` 下 `check_ready` 会恒报 `recorder: no_status` |
-| `recorder_node` | 未实现，需要 idle→recording→idle 状态机 + status |
 | `sim_bridge` 超时 | `_request` 对 setup / place 共用 9s，而 orchestrator 对 `/sim/setup` 只等 5s，违反 5.6 的「客户端 > 服务端」；应拆成两个参数 |
 | 判定样本新鲜度 | 判据不检查 `/object/pose` 的采样时刻，位姿流断掉后旧坐标仍参与 `_settled` 与 hold，理论上可判出「假成功」。当前按"不过度保护"取舍，未加防护 |
+| recorder 崩溃保护 | 依赖 SIGTERM 触发 `shutdown()` → `LeRobotDataset.finalize()`；SIGKILL / 进程崩溃时 parquet writer 不写 footer，整份数据集读不出来 |
+| `calib/detector.yaml` 旧阈值 | `radius_px: 35` 仍是 640×480 时代的；cube 的 HSV 也还是红色（方块已改黑色） |
+| `sim_app` 真值验收 | 协议（含 `type=4` 必须先于 `type=5`）已由 L2 覆盖；Isaac 侧接触/渲染正确性仍靠 L1 手工验证 |
 
 ---
 
@@ -660,7 +682,13 @@ pi/
 │   ├── base/Dockerfile         # alicia/base：Humble + numpy + v4l2_camera
 │   ├── driver/Dockerfile       # + SDK 依赖（scipy/omegaconf/synriard）
 │   ├── camera/Dockerfile       # + v4l-utils
-│   └── policy/Dockerfile       # FROM base + torch + lerobot
+│   ├── policy/Dockerfile       # FROM base + torch + lerobot
+│   ├── recorder/Dockerfile     # FROM base + lerobot + opencv-python-headless
+│   └── fastdds/profile.xml     # SHM 64MB / UDP 8MB，1280×720 大图必须
+├── sim_app/                    # Isaac Lab 侧（py3.11，无 ROS）
+│   ├── sim_app.py              # 主循环 + unix socket 协议
+│   ├── scene.py                # 桌子/杯子/相机/机械臂 + load_config
+│   └── scene.yaml              # 环境参数（task.yaml 只管物体）
 ├── ros2_ws/src/
 │   ├── alicia_d_driver/driver_node.py
 │   ├── alicia_d_cameras/{launch/bringup.launch.py, config/cameras.yaml}
@@ -671,8 +699,9 @@ pi/
 │   ├── sim_expert/sim_expert.py            # 脚本专家，RunOnce action
 │   ├── orchestrator/orchestrator_node.py   # 编排中心（见第 5 节）
 │   ├── alicia_interfaces/{srv/Setup.srv, srv/Place.srv, action/RunOnce.action, msg/ObjectPose.msg}
-│   └── recorder_node/          # ⬜ 未建
-├── tests/                      # 容器内 pytest：orchestrator + sim_expert
+│   └── recorder/recorder_node.py           # LeRobot 录制（staging → 回灌）
+├── tests/                      # 容器内 pytest：orchestrator + sim_expert + recorder
+│   └── integration/            # L2 端到端：test_pipeline.py + fake_sim_app.py
 ├── scripts/                    # ⬜ 待建：record/train/eval 的入口
 ├── sim_test/                   # 仿真环境验证脚本
 │   ├── smoke_isaaclab.py
@@ -706,14 +735,17 @@ pi/
 | 相机启动 | launch + 参数 + udev + 标定模板，未接真机 |
 | `orchestrator` | 容器内真 ROS：44 个用例（25 纯逻辑 + 19 假下游集成），覆盖服务失败/超时、abort 真 cancel、begin/end 顺序、未就绪跳过、汇总输出 |
 | `sim_expert` | 27 个用例（假 IK + 桩 sleep）：IK 跳解拦截、插值限速、断流与取消、夹爪保持、action 四条收尾路径 |
-| 镜像 | base / driver / camera / policy 四个都构建通过 |
+| `recorder` | 39 个单测；L2 端到端每集 ≈ 29Hz、`missing=1 stale=0`，回灌出的 parquet 可读 |
+| `sim_app` | 场景/相机/杯子/机械臂 + 10Hz 真值已实现，Isaac 侧手工验证；协议由 L2 的 `fake_sim_app` 覆盖 |
+| L2 集成测试 | 4 个用例，双容器 + fake sim_app，跑通完整专家轨迹采集与数据集落盘 |
+| 镜像 | base / driver / camera / policy / recorder 五个都构建通过 |
 
 ### 已知未做（按优先级）
 
 1. **真机上跑通 camera + driver**：设备名固定、内参标定、串口确认。这是所有真机数据的入口。
-2. **`recorder_node`**：写 LeRobot 数据集。没有它就没有训练数据。
-3. **下游对接编排契约**（详见 5.12）：`sim_app` 实现 `0x01/0x02` 指令并保证 `type=4` 先于 `type=5`；`recorder_node` 补实现与 `/recorder/status`（其余三路状态已就绪）。
-4. **`sim_app` + `sim_scene`**：Isaac Lab 场景、关节映射、脚本专家生成数据。
+2. **recorder 崩溃保护**：目前只有 SIGTERM 会走 `shutdown()` → `finalize()`；SIGKILL / 崩溃会让 parquet 缺 footer，需要每集 flush 或定期 reopen 数据集。
+3. **`calib/detector.yaml` 旧阈值**：`radius_px: 35` 还是 640×480 时代的；cube 的 HSV 仍是红色（方块已改黑色）。
+4. **`poses/reset.json`**：仍不存在，`/arm/home` 跑不了。
 5. **`pi/policy` 镜像重建**：Dockerfile 已改成 `FROM alicia/base`，但现有镜像是旧的。
 6. **`ActionChunk.msg` 消息包**：现在 chunk 挤在 `Float64MultiArray` 里。
 

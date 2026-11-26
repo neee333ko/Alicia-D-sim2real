@@ -28,6 +28,7 @@ import signal
 import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -55,16 +56,25 @@ class FrameAligner:
     「下一时刻」由 60Hz 的 /joint_states 提供，所以出帧总是滞后一条 state
     （约 17ms）。试次收尾时补不齐就丢掉最后半帧，不重复上一帧充数。
 
-    两路都只留最新值/最近两条：消息频率不低于采样频率，排队只会让「图像和
-    action 差了几百毫秒」这种错误被掩盖。
+    图像只留最新一帧（30Hz 与采样节拍同频），state 留最近 0.3s 的滚动窗口：
+    缓冲的意义是让迟到的图按时间戳找回自己的相邻对，而不是拿最新两条硬配，
+    把「图像与 action 差了几百毫秒」的错配掩盖过去。
     """
 
-    def __init__(self, image_keys=("front", "wrist"), tol_s: float = 1.0 / 30.0):
+    def __init__(self, image_keys=("front", "wrist"), tol_s: float = 0.05):
+        """tol_s 只用来判断两路相机是否同步（是否有一路掉帧）。
+
+        取 0.05s ≈ 1.5 个 30Hz 图像周期：正常相机之间的抖动远小于它，而真的
+        掉了一帧就会超过。图像传输延迟不靠这里兜底——迟到几百毫秒的图由
+        states 滚动缓冲按时间戳找回自己的相邻对，pair 不上才丢。
+        """
         self.image_keys = tuple(image_keys)
         self.tol_s = float(tol_s)
-        # 最近两条关节状态（时间升序）：配对出 state 与 action
-        self.state_prev: tuple[float, np.ndarray] | None = None
-        self.state: tuple[float, np.ndarray] | None = None
+        # 关节状态滚动缓冲（时间升序），长度按 time 裁剪：
+        # 图像晚到时能回头找到真正夹住自己的那对 state，而不是拿最新的硬配。
+        # 0.3s 是能容忍的图像延迟上限，也够覆盖真机 MJPG 的传输抖动。
+        self.history_s = 0.3
+        self.states: deque[tuple[float, np.ndarray]] = deque()
         # 相机 key -> (stamp, HxWx3 uint8)
         self.images: dict[str, tuple[float, np.ndarray]] = {}
         # 丢帧分类计数，挂到 /recorder/status 上，相机掉帧一眼能看出来
@@ -73,23 +83,30 @@ class FrameAligner:
         # 已处理到的采样时刻（图像 stamp）：出帧、丢帧都会推进它。
         # 图像回调和 state 回调都会尝试出帧，靠它保证同一拍只处理一次。
         self.last_emitted: float | None = None
+        # 等右邻 state 的图（stamp + 当时的 images 快照）。单槽足够：同一时刻
+        # 只会有一张图卡在「右邻还没来」上，再多说明上游已经乱了。
+        self.pending: tuple[float, dict[str, tuple[float, np.ndarray]]] | None = None
 
     def push_state(self, stamp: float, values) -> None:
-        """记下一条关节状态，只保留最近两条（时间升序）。
+        """记下一条关节状态，滚动保留最近 history_s 秒。
 
-        60Hz 的 state 用来夹住 30Hz 的图像：图像时刻落在 [state_prev, state]
-        之间时，前者当 observation.state，后者当 action。
+        为什么不是一个只有两条的窗口：图像要经 socket/DDS 传到本节点，晚到
+        几十到上百毫秒是常态。只留两条时，能夹住迟到图像的那对 state 早被挤
+        掉，只能拿最新两条硬配，动作就滞后了（之前把 tol_s 放宽到 150ms 就是
+        在掩盖这个问题）。留 0.3s 后，迟到的图仍能配上它自己的相邻对。
 
-        时间倒退（系统时钟被校时、上游乱序）时直接丢掉旧的两条重新起头，
-        否则 state_prev > state 会让后续配对算出负的时间差。
+        时间倒退（系统时钟被校时、上游乱序）时清空重来：否则缓冲里出现负的
+        时间跨度，配对会算出错误的夹逼区间。
         """
         arr = np.asarray(values, dtype=np.float32)
-        if self.state is not None and stamp < self.state[0]:
-            self.state_prev = None
-            self.state = (float(stamp), arr)
-            return
-        self.state_prev = self.state
-        self.state = (float(stamp), arr)
+        if self.states and stamp < self.states[-1][0]:
+            self.states.clear()
+        self.states.append((float(stamp), arr))
+
+        # 至少留两条：只留一条时连「左邻 + 右邻」都凑不出来
+        horizon = float(stamp) - self.history_s
+        while len(self.states) > 2 and self.states[0][0] < horizon:
+            self.states.popleft()
 
     def push_image(self, key: str, stamp: float, rgb) -> None:
         """记下某台相机的最新一帧。
@@ -105,49 +122,73 @@ class FrameAligner:
     def try_frame(self) -> dict | None:
         """凑齐就吐一帧，否则 None。图像回调和 state 回调都会调用它。
 
-        采样时刻取最新那张图的 stamp。出帧条件：每台相机都在 tol_s 之内、
-        两条相邻 state 把采样时刻夹住（左邻 = observation.state，右邻 =
-        action）。
+        采样时刻优先取 pending（上一拍等右邻 state 没等到、被暂存下来的图），
+        没有 pending 才取最新一张。然后在 state 缓冲里找真正夹住采样时刻的
+        相邻一对（左邻 <= t_img <= 右邻）：左邻当 observation.state、右邻当
+        action。不再拿最新两条硬配，迟到 200ms 的图也能配上它自己的那一对。
 
-        等 state 时不推进 last_emitted，下一路消息进来还能重试；缺图或图像
-        之间差太多则直接放弃这一拍并计数，不拿旧图凑数。
+        右邻还没到（t_img 比最新 state 还新）时把这一拍存进 pending，等 state
+        回调再配；图已经老过缓冲下界说明迟到超过 history_s，才计数丢弃。
+        tol_s 只用来判断两路相机是否同步，不参与 state 配对。
+
+        出帧后把水位推到「当前所有图里最新的 stamp」：两台相机各自触发时，稍
+        晚的那台不会再把同一对图像出一遍，避免相隔几毫秒的重复样本。
         """
-        if not self.images:
-            return None
-        t_img = max(stamp for stamp, _ in self.images.values())
-        if self.last_emitted is not None and t_img <= self.last_emitted:
+        if self.pending is not None:
+            t_img, images = self.pending
+        elif self.images:
+            t_img = max(stamp for stamp, _ in self.images.values())
+            images = self.images
+        else:
             return None
 
-        if len(self.images) < len(self.image_keys):
+        if self.last_emitted is not None and t_img <= self.last_emitted:
+            # 这一拍已经处理过：pending 残留清掉，新图等下一拍再配
+            self.pending = None
+            return None
+
+        if len(images) < len(self.image_keys):
             self.dropped_missing += 1
             self.last_emitted = t_img
+            self.pending = None
             return None
 
-        if any(t_img - stamp > self.tol_s for stamp, _ in self.images.values()):
+        if any(t_img - stamp > self.tol_s for stamp, _ in images.values()):
             self.dropped_stale += 1
             self.last_emitted = t_img
+            self.pending = None
             return None
 
-        if self.state is None or self.state_prev is None:
-            return None
+        states = list(self.states)
+        pair = None
+        for left, right in zip(states, states[1:]):
+            if left[0] <= t_img <= right[0]:
+                pair = (left, right)
+                break
 
-        if t_img < self.state_prev[0] - self.tol_s:
-            # state 已经跑过这个采样点，右邻等不到了
+        if pair is None:
+            if not states or t_img > states[-1][0]:
+                # 右邻还没来（或 state 才起头）：存起来，等 state 回调再配
+                if self.pending is None:
+                    self.pending = (t_img, dict(images))
+                return None
+            # 图比缓冲里最老的 state 还老：迟到超过 history_s，配不上了
             self.dropped_stale += 1
             self.last_emitted = t_img
+            self.pending = None
             return None
 
-        if self.state[0] < t_img:
-            # 右邻还没来，等 state 回调再试
-            return None
-
+        left, right = pair
         frame = {
             "stamp": t_img,
-            "state": self.state_prev[1],
-            "action": self.state[1],
-            "images": {k: img for k, (_, img) in self.images.items()},
+            "state": left[1],
+            "action": right[1],
+            "images": {k: img for k, (_, img) in images.items()},
         }
-        self.last_emitted = t_img
+        self.last_emitted = max(
+            [t_img] + [stamp for stamp, _ in self.images.values()]
+        )
+        self.pending = None
         return frame
 
 
@@ -507,8 +548,20 @@ class RecorderNode(Node):
             ok = bool(result.get("success"))
 
             if n <= 0:
-                self.get_logger().warn(f"ep={ep_id} 没有有效帧，丢弃")
+                # 带上对齐器的丢帧计数，否则只能看到 frames=0，没法判断是
+                # 「图没来」还是「时间戳对不上」。
+                self.get_logger().warn(
+                    f"ep={ep_id} 没有有效帧，丢弃"
+                    f"（missing={self.aligner.dropped_missing}"
+                    f" stale={self.aligner.dropped_stale}）"
+                )
             else:
+                # 有帧也报一次丢帧数：录制期间的掉帧（图像丢包、配对失败）
+                # 只能从这里看出来，否则 15Hz 和 30Hz 在日志里长得一样。
+                self.get_logger().info(
+                    f"ep={ep_id} 对齐统计：丢帧 missing={self.aligner.dropped_missing}"
+                    f" stale={self.aligner.dropped_stale}"
+                )
                 root = self.main_root if ok else self.failed_root
                 self._ingest(self._dataset(root), ep, n, result)
 
@@ -613,16 +666,28 @@ class RecorderNode(Node):
         )
 
     def shutdown(self) -> None:
-        """退出前收尾：丢掉没录完的，等正在回灌的跑完。
+        """退出前收尾：丢掉没录完的，等回灌跑完，再关数据集。
 
         录制中的 staging 直接删——没有 result 就无法归档，留着只占盘。
         回灌中的必须等：一次回灌几十秒，Ctrl-C 砍在这里会留下半条 episode。
+
+        最后的 finalize 不能省：lerobot v3 的 parquet writer 是流式的，只在
+        finalize 时写 footer。少了它文件停在半截（没有结尾的 PAR1），pyarrow
+        直接报 "Parquet magic bytes not found"，整份数据集都读不出来。
         """
         if self.ep is not None:
             self.get_logger().warn(f"退出时丢弃未完成的录制 ep={self.ep_id}")
             shutil.rmtree(self.ep.dir, ignore_errors=True)
             self.ep = None
         self._flush_pool.shutdown(wait=True)
+        for root, ds in self._datasets.items():
+            try:
+                ds.finalize()
+            except Exception:  # noqa: BLE001 - 一个数据集收尾失败不该影响其他
+                self.get_logger().error(
+                    f"数据集 finalize 失败：{root}\n{traceback.format_exc()}"
+                )
+        self._datasets.clear()
 
 
 def main(argv=None) -> None:

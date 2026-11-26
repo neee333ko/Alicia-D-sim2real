@@ -346,6 +346,7 @@ def run(cfg: dict, app) -> None:
     physics_dt = 1.0 / float(cfg["sim"]["physics_hz"])
     render_period = 1.0 / float(cfg["sim"]["render_hz"])
     info_period = 1.0
+    object_period = 0.1
     settle_tol = float(cfg["place"]["settle_tol_rad"])
     settle_hold = float(cfg["place"]["settle_hold_s"])
     home_timeout = float(cfg["place"]["home_timeout_s"])
@@ -354,6 +355,7 @@ def run(cfg: dict, app) -> None:
     next_tick = time.monotonic()
     next_render = 0.0
     next_info = 0.0
+    next_object = 0.0
     next_log = 0.0
 
     try:
@@ -421,6 +423,18 @@ def run(cfg: dict, app) -> None:
                 server.send(protocol.frame_image(protocol.CAM_FRONT, front, stamp))
                 server.send(protocol.frame_image(protocol.CAM_WRIST, wrist, stamp))
                 next_render = now + render_period
+
+            # ---- 周期真值 ------------------------------------------------
+            # detector 的 ground_truth 判据读 /object/pose 的当前值。只在
+            # setup/place 时发一次不够：方块被捡起放进杯子后位置变了，而它
+            # 手上还是 place 那一刻的坐标，判定会永远停在"没放进"。10Hz
+            # 远高于判定需要的精度，读两个 prim 位姿的开销也可以忽略。
+            if now >= next_object:
+                cup_truth, cube_truth = sc.read_object_truth()
+                server.send(
+                    protocol.frame_object(cup_truth, cube_truth, time.time())
+                )
+                next_object = now + object_period
 
             # ---- 1Hz 状态打印（调试用，看关节有没有被重力拖走） ------------
             if now >= next_log:

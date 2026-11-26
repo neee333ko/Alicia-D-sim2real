@@ -31,6 +31,19 @@ RUN rm -rf /usr/lib/python3/dist-packages/numpy-*.egg-info \
            /usr/lib/python3/dist-packages/PyYAML-*.egg-info \
            /usr/lib/python3/dist-packages/scipy-*.egg-info
 
+# Fast DDS 传输配置：1280x720 单帧 2.7MB，默认 SHM 段装不下会回退 UDP 分片，
+# 跨容器丢一个分片整帧就废（实测 recorder 只收到约一半图像帧）。profile 把
+# SHM 段放到 64MB、UDP socket 缓冲放到 8MB。
+#
+# 打在镜像里而不是运行时 -v/-e：发布方和订阅方必须都生效，漏掉任意一端就会
+# 退回默认传输。所有上层镜像（driver/camera/policy/recorder）都 FROM 这一层，
+# 继承这里的 ENV，不用逐个传参。
+#
+# 注意：改完要重建 base 及其上层镜像才生效；未重建的旧镜像仍可用运行时
+# -e FASTRTPS_DEFAULT_PROFILES_FILE=<挂载路径>/profile.xml 覆盖。
+COPY docker/fastdds/profile.xml /opt/alicia/fastdds/profile.xml
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/alicia/fastdds/profile.xml
+
 # 不用 root 跑：容器和宿主共用挂载目录，root 写出来的文件在宿主上改不动
 ARG USER_UID=1018
 ARG USER_GID=1018

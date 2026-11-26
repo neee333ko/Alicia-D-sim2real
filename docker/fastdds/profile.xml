@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+Fast DDS 传输配置，给 1280x720 图像（单帧 2.7MB）用的。
+
+默认配置装不下这种大消息：SHM 段太小会回退到 UDP，而 UDP 默认 socket
+缓冲只有几百 KB，2.7MB 要切成 40 多个分片，跨容器时丢一个分片整帧就废。
+实测 recorder 只能收到约一半的图像帧。
+
+这里做两件事：
+  1. SHM 段放到 64MB，一帧 2.7MB 走共享内存是零拷贝，不会分片
+  2. 万一仍然回退 UDP，socket 缓冲放到 8MB，容得下整帧的分片
+
+用法：
+  alicia/base 及其上层镜像已把本文件 COPY 到 /opt/alicia/fastdds/profile.xml，
+  并用 ENV FASTRTPS_DEFAULT_PROFILES_FILE 指过去，运行时不需要额外参数。
+  旧镜像（没重建过的）可以挂载本文件并覆盖环境变量：
+    -v <repo>/docker/fastdds/profile.xml:/opt/alicia/fastdds/profile.xml:ro
+    -e FASTRTPS_DEFAULT_PROFILES_FILE=/opt/alicia/fastdds/profile.xml
+两端（发布方和订阅方）都要生效，否则只有一侧用新配置，还是会落回默认传输。
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>shm_large</transport_id>
+      <type>SHM</type>
+      <!-- 64MB：能同时容纳若干帧在途，又不至于让每个进程预占太多 -->
+      <segment_size>67108864</segment_size>
+      <port_queue_capacity>512</port_queue_capacity>
+      <healthy_check_timeout_ms>1000</healthy_check_timeout_ms>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>udp_large</transport_id>
+      <type>UDPv4</type>
+      <sendBufferSize>8388608</sendBufferSize>
+      <receiveBufferSize>8388608</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <!-- is_default_profile：所有 participant 都用这套，不需要逐个节点指定 -->
+  <participant profile_name="large_image" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_large</transport_id>
+        <transport_id>shm_large</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>
